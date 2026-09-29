@@ -1,0 +1,8 @@
+bin/
+obj/
+relay-state.json*
+.env*
+!.env.example
+appsettings.*.local.json
+logs/
+artifacts/
