@@ -26,7 +26,9 @@ public sealed class Worker : BackgroundService
     private readonly HashSet<string> _loadedThreads = new();
     private AppServerClient? _server;
     private Run? _run;
+    private volatile bool _serverDisconnected;
     private DateTime _lastQueueRetryAt;
+    private readonly string _healthFile;
 
     public Worker(ILogger<Worker> log, ILogger<AppServerClient> serverLog, RelayOptions options)
     {
@@ -34,6 +36,7 @@ public sealed class Worker : BackgroundService
         _options = options;
         _options.Validate();
         _store = new StateStore(options.StateFile);
+        _healthFile = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(options.StateFile))!, "logs", "health.txt");
         foreach (var (name, path) in _store.State.Projects)
         {
             if (Path.IsPathFullyQualified(path) && IsWithinProject(path, options.ProjectCreationRoot))
@@ -48,18 +51,30 @@ public sealed class Worker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
+        PublishHealth("starting");
         _server = new AppServerClient(ServerLog, _options.ResolveCodex());
         _server.Message += msg => { _events.Writer.TryWrite(msg); return Task.CompletedTask; };
+        _server.Disconnected += () =>
+        {
+            _serverDisconnected = true;
+            _events.Writer.TryWrite(JsonSerializer.SerializeToElement(new
+            {
+                method = "relay/disconnected", @params = new { }
+            }));
+            return Task.CompletedTask;
+        };
         await _server.InitializeAsync(ct);
         _ = ProcessEvents(ct);
         await _bot.DeleteWebhook(dropPendingUpdates: false, cancellationToken: ct);
         await StartQueued(ct);
         while (!ct.IsCancellationRequested)
         {
+            if (_serverDisconnected) throw new IOException("Codex App Server disconnected; scheduled task will restart.");
             try
             {
                 var updates = await _bot.GetUpdates(offset: _store.State.UpdateOffset, timeout: 25,
                     allowedUpdates: new[] { UpdateType.Message, UpdateType.CallbackQuery }, cancellationToken: ct);
+                PublishHealth("ready");
                 foreach (var update in updates)
                 {
                     await _gate.WaitAsync(ct);
@@ -78,6 +93,20 @@ public sealed class Worker : BackgroundService
                     }
                     finally { _gate.Release(); }
                 }
+                if (_run != null && DateTime.UtcNow - _run.Trace.LastEventAt > TimeSpan.FromMinutes(2) &&
+                    DateTime.UtcNow - _run.LastSilenceWarningAt > TimeSpan.FromMinutes(1))
+                {
+                    await _gate.WaitAsync(ct);
+                    try
+                    {
+                        if (_run != null && DateTime.UtcNow - _run.Trace.LastEventAt > TimeSpan.FromMinutes(2))
+                        {
+                            _run.LastSilenceWarningAt = DateTime.UtcNow;
+                            await SetStatus(_run, "Codex не присылал событий более 2 минут. Соединение проверяется; /log покажет уже выполненное.", ct, force: true);
+                        }
+                    }
+                    finally { _gate.Release(); }
+                }
                 if (_run == null && _store.State.PendingTasks.Count > 0 &&
                     DateTime.UtcNow - _lastQueueRetryAt >= TimeSpan.FromSeconds(30))
                 {
@@ -90,8 +119,23 @@ public sealed class Worker : BackgroundService
             catch (Exception ex)
             {
                 _log.LogError(ex, "Telegram polling failed");
+                PublishHealth("error");
                 await Task.Delay(TimeSpan.FromSeconds(5), ct);
             }
+        }
+    }
+
+    private void PublishHealth(string state)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_healthFile)!);
+            File.WriteAllText(_healthFile,
+                $"{Environment.ProcessId}|{state}|{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _log.LogWarning(ex, "Could not update tray health file");
         }
     }
 
@@ -130,12 +174,15 @@ public sealed class Worker : BackgroundService
                 if (address.IsGeneral) await ShowGeneralMenu(address, null, ct);
                 else await SendUi(address,
                     "<b>Рабочая тема</b>\n<i>Чат Codex</i>\n\n" +
-                    "<blockquote>Просто напишите задачу. Ответ Codex появится в этой теме.</blockquote>\n\n" +
+                    "<blockquote>Напишите задачу. Пока Codex работает, новое сообщение уточнит её; отдельную задачу отправьте через /queue.</blockquote>\n\n" +
                     "<b>Управление</b>\n" +
                     "<code>/status</code>  Информация о чате\n" +
                     "<code>/last</code>  Последний ответ\n" +
+                    "<code>/log</code>  Журнал задачи\n" +
                     "<code>/fork</code>  Ветка чата\n" +
                     "<code>/usage</code>  Лимиты Codex\n" +
+                    "<code>/steer</code>  Уточнить текущую задачу\n" +
+                    "<code>/queue</code>  Следующая задача\n" +
                     "<code>/stop</code>  Остановить задачу", ct, TopicButtons());
                 break;
             case "/projects":
@@ -222,6 +269,7 @@ public sealed class Worker : BackgroundService
                 else
                     await SendUi(address, $"<b>{(_run?.Address == address ? "Задача выполняется" : "Чат готов")}</b>\n" +
                         $"<i>{H(ProjectLabel(binding.Project))}</i>\n\n" +
+                        $"<b>Модель</b>  {H(_run?.Address == address ? _run.Model : ThreadModel.Resolve(binding.ThreadId))}\n" +
                         $"<b>В очереди</b>  {_store.State.PendingTasks.Count(task => task.ChatId == address.ChatId && task.TopicId == address.TopicId)}\n\n" +
                         "<b>Последний ответ</b>\n" + AnswerBlock(await LastAnswer(binding.ThreadId, ct), 2100) +
                         "\n\n<blockquote expandable><b>Привязка</b>\n" +
@@ -239,6 +287,9 @@ public sealed class Worker : BackgroundService
                 else
                     await SendLastAnswer(address, lastBinding.ThreadId, ct);
                 break;
+            case "/log":
+                await SendTrace(address, ct);
+                break;
             case "/fork":
                 if (address.IsGeneral || !_store.State.Topics.TryGetValue(address.Key, out var forkBinding))
                     await Send(address, "Команда доступна в привязанном рабочем topic.", ct);
@@ -246,6 +297,24 @@ public sealed class Worker : BackgroundService
                     await Send(address, "Дождитесь завершения текущей задачи и повторите /fork.", ct);
                 else
                     await ForkThreadTopic(address, forkBinding, ct);
+                break;
+            case "/steer":
+                if (address.IsGeneral || _run?.Address != address)
+                    await Send(address, "В этой теме сейчас нет активной задачи. Просто напишите новую задачу.", ct);
+                else if (arg.Length == 0)
+                    await Send(address, "Формат: /steer <уточнение>. Во время работы можно просто написать сообщение.", ct);
+                else
+                    await SteerTask(_run, arg, ct);
+                break;
+            case "/queue":
+                if (address.IsGeneral || !_store.State.Topics.ContainsKey(address.Key))
+                    await Send(address, "Команда доступна в привязанной рабочей теме.", ct);
+                else if (arg.Length == 0)
+                    await Send(address, "Формат: /queue <следующая задача>", ct);
+                else if (_run == null)
+                    await StartTask(address, arg, ct);
+                else
+                    await QueueTask(address, arg, ct);
                 break;
             case "/stop":
                 if (_run?.Address != address || _run.TurnId is not { } turnId)
@@ -433,8 +502,9 @@ public sealed class Worker : BackgroundService
     {
         new[]
         {
-            InlineKeyboardButton.WithCallbackData("Показать ответ", "t:l"),
-            InlineKeyboardButton.WithCallbackData("Создать ветку", "t:f")
+            InlineKeyboardButton.WithCallbackData("Ответ", "t:l"),
+            InlineKeyboardButton.WithCallbackData("Журнал", "t:j"),
+            InlineKeyboardButton.WithCallbackData("Ветка", "t:f")
         }
     });
 
@@ -1168,6 +1238,7 @@ public sealed class Worker : BackgroundService
                 return;
             }
             if (parts[1] == "l") await SendLastAnswer(address, binding.ThreadId, ct);
+            else if (parts[1] == "j") await SendTrace(address, ct);
             else if (parts[1] == "f")
             {
                 if (_run?.Address == address)
@@ -1217,11 +1288,14 @@ public sealed class Worker : BackgroundService
             await TaskStatus(address, statusMessageId, "Topic не привязан. /threads <проект>", ct);
             return true;
         }
+        if (_run?.Address == address && queued == null)
+        {
+            await SteerTask(_run, text, ct);
+            return false;
+        }
         if (_run != null)
         {
-            statusMessageId = await TaskStatus(address, statusMessageId, "В очереди", ct);
-            _store.State.PendingTasks.Add(new PendingTask(address.ChatId, address.TopicId, text, statusMessageId));
-            await _store.SaveAsync();
+            await QueueTask(address, text, ct, statusMessageId);
             return false;
         }
         if (!TryProjectRoot(binding.Project, out var path))
@@ -1262,7 +1336,11 @@ public sealed class Worker : BackgroundService
             await TaskStatus(address, statusMessageId, loadError, ct);
             return true;
         }
-        var run = new Run(address, binding.Project, binding.ThreadId);
+        var run = new Run(address, binding.Project, binding.ThreadId)
+        {
+            Model = ThreadModel.Resolve(binding.ThreadId)
+        };
+        run.Trace.Add("Задача отправлена в Codex");
         _run = run;
         try
         {
@@ -1271,14 +1349,53 @@ public sealed class Worker : BackgroundService
             var result = await _server!.CallAsync("turn/start", new { threadId = binding.ThreadId,
                 input = new[] { new { type = "text", text } } }, ct);
             run.TurnId = result.GetProperty("turn").GetProperty("id").GetString();
+            run.Trace.Add("Turn запущен");
+            await SetStatus(run, "Выполняется", ct, force: true);
             return true;
         }
         catch (Exception ex)
         {
-            await SetStatus(run, "Не удалось запустить", ct, force: true);
+            run.Error = ex.Message;
+            run.Trace.Add("Ошибка запуска", ex.Message);
+            await SetStatus(run, "Не удалось запустить: " + ex.Message, ct, force: true);
             _run = null;
-            await Send(address, "Ошибка: " + ex.Message, ct);
+            await SaveTrace(run);
+            await Send(address, "Ошибка запуска Codex: " + ex.Message, ct);
             return true;
+        }
+    }
+
+    private async Task QueueTask(TopicAddress address, string text, CancellationToken ct,
+        int statusMessageId = 0, string status = "В очереди")
+    {
+        statusMessageId = await TaskStatus(address, statusMessageId, status, ct);
+        _store.State.PendingTasks.Add(new PendingTask(address.ChatId, address.TopicId, text, statusMessageId));
+        await _store.SaveAsync();
+    }
+
+    private async Task SteerTask(Run run, string text, CancellationToken ct)
+    {
+        if (run.Stopping || run.TurnId is not { } turnId)
+        {
+            await QueueTask(run.Address, text, ct, status: "Текущий turn уже завершается. Сообщение в очереди.");
+            return;
+        }
+        try
+        {
+            var result = await _server!.CallAsync("turn/steer",
+                new { threadId = run.ThreadId, expectedTurnId = turnId,
+                    input = new[] { new { type = "text", text } } }, ct);
+            if (GetString(result, "turnId") != turnId)
+                throw new InvalidOperationException("App Server вернул другой turn ID.");
+            run.SteerCount++;
+            await SetStatus(run, run.Progress, ct, force: true);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Could not steer turn {TurnId}", turnId);
+            await QueueTask(run.Address, text, ct,
+                status: "Уточнение не принято активным turn. Сообщение сохранено для следующего turn.");
         }
     }
 
@@ -1313,6 +1430,21 @@ public sealed class Worker : BackgroundService
         if (!msg.TryGetProperty("method", out var methodElement) ||
             !msg.TryGetProperty("params", out var p)) return;
         var method = methodElement.GetString();
+        if (method == "relay/disconnected")
+        {
+            PublishHealth("error");
+            if (_run is { } disconnectedRun)
+            {
+                disconnectedRun.Error = "Соединение с Codex App Server оборвалось. Бот перезапускается. Проверьте /last перед повторной отправкой задачи.";
+                if (disconnectedRun.OutputTail.Length > 0)
+                    disconnectedRun.Trace.Add("Последний вывод команды", disconnectedRun.OutputTail);
+                disconnectedRun.Trace.Add("Соединение оборвалось", disconnectedRun.Error);
+                _run = null;
+                await SaveTrace(disconnectedRun);
+                await Complete(disconnectedRun, "failed", disconnectedRun.Error, ct);
+            }
+            return;
+        }
         if (msg.TryGetProperty("id", out var requestId))
         {
             if (method is "item/commandExecution/requestApproval" or "item/fileChange/requestApproval" or "item/permissions/requestApproval")
@@ -1320,20 +1452,49 @@ public sealed class Worker : BackgroundService
             else await _server!.RejectAsync(requestId, "CodexRelay does not support this request", ct);
             return;
         }
-        if (_run == null || !Matches(_run, p)) return;
+        if (_run == null || (!Matches(_run, p) &&
+            !(method is "error" or "warning" && GetString(p, "threadId").Length == 0))) return;
         var run = _run;
+        run.Trace.Touch();
         if (run.Stopping && method != "turn/completed") return;
         switch (method)
         {
             case "turn/started":
                 run.TurnId = p.GetProperty("turn").GetProperty("id").GetString();
+                run.Trace.Add("Turn запущен");
                 break;
             case "item/started":
                 var item = p.GetProperty("item");
                 if (GetString(item, "type") == "commandExecution")
-                    await SetStatus(run, "Выполняю команду", ct);
+                {
+                    run.ActionKind = "Команда";
+                    run.ActionText = GetString(item, "command");
+                    run.ActionDirectory = GetString(item, "cwd");
+                    run.Trace.Add("Команда", run.ActionText + (run.ActionDirectory.Length == 0 ? "" : "\nКаталог: " + run.ActionDirectory));
+                    await SetStatus(run, "Выполняю команду", ct, force: true);
+                }
                 else if (GetString(item, "type") == "fileChange")
-                    await SetStatus(run, "Изменяю файлы", ct);
+                {
+                    run.ActionKind = "Изменение файлов";
+                    run.ActionText = ChangePaths(item);
+                    run.ActionDirectory = "";
+                    run.Trace.Add("Изменение файлов", run.ActionText);
+                    await SetStatus(run, "Изменяю файлы", ct, force: true);
+                }
+                else if (GetString(item, "type") == "agentMessage" &&
+                    GetString(item, "phase") == "final_answer")
+                {
+                    run.ActionKind = "";
+                    await SetStatus(run, "Формирую ответ", ct, force: true);
+                }
+                else if (GetString(item, "type") is { Length: > 0 } startedType &&
+                    startedType != "agentMessage")
+                {
+                    run.ActionKind = startedType;
+                    run.ActionText = GetString(item, "name");
+                    run.Trace.Add("Начато: " + startedType, run.ActionText);
+                    await SetStatus(run, "Выполняется: " + startedType, ct, force: true);
+                }
                 break;
             case "item/completed":
                 item = p.GetProperty("item");
@@ -1344,24 +1505,79 @@ public sealed class Worker : BackgroundService
                 else if (type == "commandExecution")
                 {
                     var command = GetString(item, "command");
+                    var exitCode = GetString(item, "exitCode");
+                    var output = GetString(item, "aggregatedOutput");
+                    run.Trace.Add("Команда завершена · код " + (exitCode.Length == 0 ? "неизвестен" : exitCode),
+                        output.Length == 0 ? command : command + "\nВывод:\n" + Clip(output, 2500));
                     if (IsTestCommand(command))
-                        run.Tests.Add($"{command}: exit {GetString(item, "exitCode")}");
+                        run.Tests.Add($"{command}: exit {exitCode}");
+                    if (run.ActionKind == "Команда" && run.ActionText == command)
+                        await SetStatus(run, exitCode.Length == 0
+                            ? "Команда завершена" : $"Команда завершена · код {exitCode}", ct, force: true);
                 }
-                else if (type == "fileChange" && item.TryGetProperty("changes", out var changes))
+                else if (type == "fileChange" && item.TryGetProperty("changes", out var changes) &&
+                    changes.ValueKind == JsonValueKind.Array)
+                {
                     foreach (var change in changes.EnumerateArray()) run.Files.Add(GetString(change, "path"));
+                    run.ActionKind = "Изменение файлов";
+                    run.ActionText = ChangePaths(item);
+                    run.ActionDirectory = "";
+                    run.Trace.Add("Файлы изменены", run.ActionText);
+                    await SetStatus(run, "Файлы изменены", ct, force: true);
+                }
+                else if (type is not ("agentMessage" or "reasoning") && type.Length > 0)
+                {
+                    run.Trace.Add("Завершено: " + type, GetString(item, "name"));
+                    await SetStatus(run, "Завершено: " + type, ct, force: true);
+                }
                 break;
             case "error":
                 if (p.TryGetProperty("error", out var error))
                 {
                     run.Error = GetString(error, "message");
+                    run.Trace.Add("Ошибка Codex", run.Error);
                     await SetStatus(run, "Ошибка: " + run.Error, ct, force: true);
                 }
                 break;
+            case "item/commandExecution/outputDelta":
+                var delta = GetString(p, "delta");
+                if (delta.Length > 0) run.OutputTail = Clip(run.OutputTail + delta, 1800);
+                await SetStatus(run, run.Progress, ct);
+                break;
+            case "turn/plan/updated":
+                if (p.TryGetProperty("plan", out var plan) && plan.ValueKind == JsonValueKind.Array)
+                {
+                    var steps = string.Join("\n", plan.EnumerateArray().Select(x =>
+                        GetString(x, "status") + "  " + GetString(x, "step")));
+                    if (steps != run.LastPlan)
+                    {
+                        run.LastPlan = steps;
+                        run.Trace.Add("План", Clip(steps, 1500));
+                        await SetStatus(run, "План обновлён", ct, force: true);
+                    }
+                }
+                break;
+            case "model/rerouted":
+                var toModel = GetString(p, "toModel");
+                if (toModel.Length > 0)
+                {
+                    run.Model = toModel;
+                    run.Trace.Add("Модель переключена", toModel + " · " + GetString(p, "reason"));
+                    await SetStatus(run, "Модель переключена", ct, force: true);
+                }
+                break;
+            case "warning":
+                run.Trace.Add("Предупреждение", GetString(p, "message"));
+                await SetStatus(run, "Предупреждение Codex", ct, force: true);
+                break;
             case "turn/completed":
                 var turn = p.GetProperty("turn");
+                run.Model = ThreadModel.Resolve(run.ThreadId);
+                run.Trace.Add("Turn завершён", GetString(turn, "status"));
                 _run = null;
                 try
                 {
+                    await SaveTrace(run);
                     await Complete(run, GetString(turn, "status"),
                         turn.TryGetProperty("error", out var err) ? GetString(err, "message") : run.Error, ct);
                     if (_store.State.Topics.TryGetValue(run.Address.Key, out var finishedBinding) &&
@@ -1381,17 +1597,45 @@ public sealed class Worker : BackgroundService
         }
     }
 
+    private static string ChangePaths(JsonElement item) =>
+        item.TryGetProperty("changes", out var changes) && changes.ValueKind == JsonValueKind.Array
+            ? string.Join("\n", changes.EnumerateArray().Take(5).Select(change => GetString(change, "path")))
+            : "";
+
     private async Task<bool> SetStatus(Run run, string progress, CancellationToken ct, bool force = false)
     {
+        run.Progress = progress;
         if (!force && DateTime.UtcNow - run.LastStatusAt < TimeSpan.FromSeconds(8)) return true;
         if (run.StatusMessageId == 0) return false;
         var pending = _approvals.Where(x => x.Value.ThreadId == run.ThreadId).ToArray();
-        var text = TaskStatusMarkup(Clip(progress, 600));
+        var text = TaskStatusMarkup(Clip(progress, 500)) + "\n<b>Модель</b>  " + H(run.Model);
+        if (_run == run)
+        {
+            if (run.ActionKind.Length > 0)
+            {
+                text += "\n\n<b>" + H(run.ActionKind) + "</b>";
+                if (run.ActionText.Length > 0)
+                    text += "\n<pre>" + H(Clip(run.ActionText, 600)) + "</pre>";
+                if (run.ActionDirectory.Length > 0)
+                    text += "\n<i>Каталог</i>  <code>" + H(Clip(run.ActionDirectory, 180)) + "</code>";
+                if (run.OutputTail.Length > 0)
+                    text += "\n<i>Последний вывод</i>\n<pre>" + H(Clip(run.OutputTail, 350)) + "</pre>";
+            }
+            if (run.SteerCount > 0)
+                text += $"\n\n<i>Уточнений принято: {run.SteerCount}</i>";
+            text += "\n<i>Уточнение можно отправить обычным сообщением.</i>";
+        }
+        if (run.Trace.Entries.Count > 0)
+            text += "\n\n<blockquote expandable><b>Ход работы · " + run.Trace.Entries.Count + "</b>\n" +
+                H(run.Trace.Recent(900)) + "</blockquote>\n<i>Полный журнал: /log</i>";
         if (pending.Length > 0)
             text += "\n\n<b>Нужно подтверждение</b>\n<blockquote expandable>" +
                 string.Join("\n\n", pending.Take(4).Select(x => H(Clip(x.Value.Detail, 400)))) +
                 "</blockquote>";
-        if (text == run.StatusText && !force) return true;
+        if (text.Length > 3900)
+            text = TaskStatusMarkup(Clip(progress, 500)) + "\n<b>Модель</b>  " + H(run.Model) +
+                "\n<i>Подробности: /log</i>";
+        if (text == run.StatusText && pending.Length == 0) return true;
         var buttons = pending.Select(x => new[]
         {
             InlineKeyboardButton.WithCallbackData("Разрешить", $"a:{x.Key}:y"),
@@ -1413,14 +1657,17 @@ public sealed class Worker : BackgroundService
     private async Task Complete(Run run, string status, string error, CancellationToken ct)
     {
         await SetStatus(run, status == "completed" ? "Готово" : "Завершено: " + status, ct, force: true);
-        var answer = string.IsNullOrWhiteSpace(run.Answer) ? "(нет ответа)" : run.Answer;
+        var failure = string.IsNullOrWhiteSpace(error) ? run.Error : error;
+        var answer = string.IsNullOrWhiteSpace(run.Answer)
+            ? string.IsNullOrWhiteSpace(failure) ? "Codex завершил turn без ответа. Проверьте /log." : "Ошибка Codex: " + failure
+            : run.Answer;
         var title = status == "completed" ? "Готово" : "Завершено: " + status;
         var details = new List<string>();
-        if (!string.IsNullOrWhiteSpace(error)) details.Add("Ошибка: " + error);
+        if (!string.IsNullOrWhiteSpace(failure)) details.Add("Ошибка: " + failure);
         if (run.Tests.Count > 0) details.Add("Проверки: " + string.Join("; ", run.Tests));
         if (run.Files.Count > 0) details.Add("Файлы: " + string.Join(", ", run.Files.Order()));
         var markup = $"<b>{H(title)}</b>\n<i>Ответ Codex</i>\n\n" +
-            TelegramMarkup.RenderAnswer(answer);
+            "<b>Модель</b>  " + H(run.Model) + "\n\n" + TelegramMarkup.RenderAnswer(answer);
         if (details.Count > 0)
             markup += "\n\n<blockquote expandable><b>Детали выполнения</b>\n" +
                 H(string.Join("\n", details)) + "</blockquote>";
@@ -1433,6 +1680,31 @@ public sealed class Worker : BackgroundService
             await _bot.SendDocument(run.Address.ChatId, InputFile.FromStream(stream, "answer.txt"),
                 caption: title, messageThreadId: run.Address.TopicId, cancellationToken: ct);
         }
+    }
+
+    private async Task SaveTrace(Run run)
+    {
+        _store.State.LastTurnLogs[run.Address.Key] = run.Trace.FullText;
+        await _store.SaveAsync();
+    }
+
+    private async Task SendTrace(TopicAddress address, CancellationToken ct)
+    {
+        if (address.IsGeneral || !_store.State.Topics.ContainsKey(address.Key))
+        {
+            await Send(address, "Журнал доступен в рабочем topic.", ct);
+            return;
+        }
+        var log = _run?.Address == address ? _run.Trace.FullText :
+            _store.State.LastTurnLogs.GetValueOrDefault(address.Key, "");
+        if (log.Length == 0)
+        {
+            await Send(address, "Журнал этой темы пока пуст.", ct);
+            return;
+        }
+        await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(log));
+        await _bot.SendDocument(address.ChatId, InputFile.FromStream(stream, "codex-turn.log.txt"),
+            caption: "Журнал последней задачи", messageThreadId: address.TopicId, cancellationToken: ct);
     }
 
     private async Task RequestApproval(JsonElement id, string method, JsonElement p, CancellationToken ct)
@@ -1616,9 +1888,19 @@ public sealed class Worker : BackgroundService
         public string? TurnId { get; set; }
         public int StatusMessageId { get; set; }
         public string StatusText { get; set; } = "";
+        public string Progress { get; set; } = "Выполняется";
+        public string ActionKind { get; set; } = "";
+        public string ActionText { get; set; } = "";
+        public string ActionDirectory { get; set; } = "";
+        public int SteerCount { get; set; }
         public DateTime LastStatusAt { get; set; }
+        public DateTime LastSilenceWarningAt { get; set; }
         public bool Stopping { get; set; }
         public string Answer { get; set; } = "";
+        public string Model { get; set; } = "не определена";
+        public string OutputTail { get; set; } = "";
+        public string LastPlan { get; set; } = "";
+        public TurnTrace Trace { get; } = new();
         public string Error { get; set; } = "";
         public HashSet<string> Files { get; } = new(StringComparer.OrdinalIgnoreCase);
         public List<string> Tests { get; } = new();

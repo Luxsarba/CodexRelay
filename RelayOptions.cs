@@ -44,6 +44,7 @@ public sealed class RelayState
     public Dictionary<string, string> Projects { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, TopicBinding> Topics { get; set; } = new();
     public List<PendingTask> PendingTasks { get; set; } = new();
+    public Dictionary<string, string> LastTurnLogs { get; set; } = new();
     public string? SelectedProject { get; set; }
     public Dictionary<string, string> Threads { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public int UpdateOffset { get; set; }

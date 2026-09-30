@@ -13,6 +13,7 @@ public sealed class AppServerClient : IAsyncDisposable
     private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement>> _pending = new();
     private long _nextId;
     public event Func<JsonElement, Task>? Message;
+    public event Func<Task>? Disconnected;
 
     public AppServerClient(ILogger<AppServerClient> log, string executable)
     {
@@ -95,6 +96,9 @@ public sealed class AppServerClient : IAsyncDisposable
         {
             foreach (var pending in _pending.Values)
                 pending.TrySetException(new IOException("Codex App Server disconnected."));
+            if (Disconnected is { } disconnected)
+                try { await disconnected(); }
+                catch (Exception ex) { _log.LogError(ex, "Could not report App Server disconnection"); }
         }
     }
 

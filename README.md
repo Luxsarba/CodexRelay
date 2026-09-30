@@ -42,16 +42,29 @@ Codex допускает одного записывающего владель�
 ```powershell
 $projectDir = (Get-Location).Path
 dotnet build
-$script = Join-Path $projectDir 'run-relay.ps1'
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -File "' + $script + '"')
+$launcher = Join-Path $projectDir 'run-relay-hidden.vbs'
+$action = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\wscript.exe') -Argument ('//B //Nologo "' + $launcher + '"') -WorkingDirectory $projectDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$watchTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName 'CodexRelay' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+Register-ScheduledTask -TaskName 'CodexRelay' -Action $action -Trigger @($trigger, $watchTrigger) -Principal $principal -Settings $settings -Force
 Start-ScheduledTask -TaskName 'CodexRelay'
+
+dotnet build .\Tray\CodexRelay.Tray.csproj
+$trayExe = Join-Path $projectDir 'Tray\bin\Debug\net8.0-windows\CodexRelay.Tray.exe'
+$trayAction = New-ScheduledTaskAction -Execute $trayExe -Argument ('--root "' + $projectDir + '"')
+$trayTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$traySettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName 'CodexRelayTray' -Action $trayAction -Trigger $trayTrigger -Principal $principal -Settings $traySettings -Force
+Start-ScheduledTask -TaskName 'CodexRelayTray'
 ```
 
-Лог: `logs/relay.log`. Проверка: `Get-ScheduledTask -TaskName CodexRelay`. Остановка: `Stop-ScheduledTask -TaskName CodexRelay`.
+Планировщик запускает бота без окна PowerShell через run-relay-hidden.vbs при входе и повторяет запуск каждые 5 минут, если процесс завершился. Пока бот работает, повторный запуск игнорируется. При сбое Планировщик также делает до 10 попыток с интервалом в минуту. Бот продолжает работать при переходе на батарею и после блокировки экрана. Задание использует интерактивный профиль Windows для доступа к Codex и диску S:; после выхода из учётной записи оно возобновится при следующем входе.
+
+В системном трее появляется значок Codex Relay: зелёный — бот получает ответы Telegram, жёлтый — запускается или потерял связь с Telegram, красный — остановлен. Через меню значка можно запустить или перезапустить бота и открыть журнал. Состояние определяется по сигналу от работающего процесса; зелёный значок подтверждает связь с Telegram, но не доступность сервиса Codex для каждой задачи.
+
+Лог: `logs/relay.log`. Проверка: `Get-ScheduledTask -TaskName CodexRelay`. Остановка: `Stop-ScheduledTask -TaskName CodexRelay`. Периодический триггер запустит бот снова; для постоянной остановки отключите задание командой Disable-ScheduledTask -TaskName CodexRelay.
 
 Проверка App Server без токена:
 
@@ -75,15 +88,18 @@ dotnet run --project .\CodexRelay.csproj -- --check-app-server
 В **рабочем topic**:
 
 - Обычный текст — задача в закреплённом thread.
-- `/status` — проект, thread и текущая задача.
+- `/status` — проект, thread, модель Codex и текущая задача.
 - `/usage` — лимиты и статистика токенов аккаунта.
 - `/last` — последний итоговый ответ Codex в thread.
+- `/log` — полный журнал последней задачи: команды, вывод, этапы, предупреждения и ошибки. Доступен также кнопкой «Журнал».
 - `/fork` — ветка от последнего завершённого turn в новом Codex thread и Telegram topic.
+- `/steer <текст>` — уточнить активную задачу. Во время работы можно просто написать обычное сообщение.
+- `/queue <текст>` — поставить отдельную задачу после текущей.
 - `/stop` — прервать текущий turn.
 
 Ранее созданные вручную topics по-прежнему можно привязать через `/threads <проект>` или `/bind <проект> <threadId>` внутри такого topic.
 
-Каждый turn создаёт одно сообщение статуса, которое редактируется по ходу работы и содержит кнопки подтверждений. Статус сообщает этап работы без вывода длинных команд; подробности запрашиваемого подтверждения раскрываются в отдельном блоке. По завершении отправляется один финальный ответ; длинный ответ приходит одним файлом. Сообщения, пришедшие во время активного turn или при занятом Desktop thread, сохраняются в очередь. Бот одновременно выполняет один turn.
+Каждый turn создаёт одно сообщение статуса, которое редактируется по ходу работы и содержит кнопки подтверждений. Статус показывает модель, текущую команду, каталог, последний вывод, этап работы и раскрываемую недавнюю историю. Полный журнал доступен по /log во время работы и после завершения; последний журнал сохраняется после перезапуска. Модель берётся из последнего контекста привязанного Codex thread; для нового thread до первого turn показывается модель по умолчанию из конфигурации, если она доступна. Переключение модели Codex отображается в статусе. Если App Server оборвёт соединение, статус и финальное сообщение покажут ошибку, а запланированная задача перезапустит бот. После двух минут без событий статус предупредит о задержке. По завершении отправляется один финальный ответ; длинный ответ приходит одним файлом. Обычное сообщение в той же теме во время активного turn передаётся через `turn/steer` как уточнение; число принятых уточнений видно в статусе. `/steer <текст>` делает то же явно. `/queue <текст>` ставит отдельную задачу после текущей. Сообщения в других темах и задачи при занятом Desktop thread сохраняются в очередь. Если уточнение уже нельзя принять, бот явно сообщает об этом и ставит текст в очередь. Бот одновременно выполняет один turn.
 
 ## Безопасность и ограничения
 
