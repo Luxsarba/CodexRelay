@@ -1283,17 +1283,12 @@ public sealed class Worker : BackgroundService
         if (markup.Length <= 3900)
         {
             await SendUi(address, markup, ct);
-            if (_store.State.Topics.TryGetValue(address.Key, out var binding))
-                await SendReferencedImages(address, binding, answer, new HashSet<string>(StringComparer.OrdinalIgnoreCase), ct);
             return;
         }
         await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(answer));
         await _bot.SendDocument(address.ChatId, InputFile.FromStream(stream, "last-answer.txt"),
             caption: "Последний ответ", messageThreadId: address.TopicId,
             cancellationToken: ct);
-        if (_store.State.Topics.TryGetValue(address.Key, out var longBinding))
-            await SendReferencedImages(address, longBinding, answer,
-                new HashSet<string>(StringComparer.OrdinalIgnoreCase), ct);
     }
 
     private static string DescribeLastAnswer(JsonElement[] turns)
@@ -1631,16 +1626,12 @@ public sealed class Worker : BackgroundService
                     var messageText = GetString(item, "text");
                     if (GetString(item, "phase") is "final_answer" or "")
                         run.Answer = messageText;
-                    if (messageText.Length > 0 &&
-                        _store.State.Topics.TryGetValue(run.Address.Key, out var mediaBinding))
-                        await SendReferencedImages(run.Address, mediaBinding, messageText,
-                            run.SentImages, ct);
                 }
                 else if (type == "imageView")
                 {
-                    if (_store.State.Topics.TryGetValue(run.Address.Key, out var imageBinding))
-                        await SendLocalImage(run.Address, imageBinding, GetString(item, "path"),
-                            "Просмотрено во время работы", run.SentImages, ct);
+                    var viewedPath = GetString(item, "path");
+                    if (viewedPath.Length > 0) run.ViewedFiles.Add(viewedPath);
+                    run.Trace.Add("Просмотр изображения", viewedPath);
                 }
                 else if (type == "commandExecution")
                 {
@@ -1817,8 +1808,6 @@ public sealed class Worker : BackgroundService
             await _bot.SendDocument(run.Address.ChatId, InputFile.FromStream(stream, "answer.txt"),
                 caption: title, messageThreadId: run.Address.TopicId, cancellationToken: ct);
         }
-        if (_store.State.Topics.TryGetValue(run.Address.Key, out var binding))
-            await SendReferencedImages(run.Address, binding, answer, run.SentImages, ct);
     }
 
     private static readonly Regex FileLink = new(
@@ -1836,9 +1825,16 @@ public sealed class Worker : BackgroundService
             var root = Path.GetFullPath(binding.WorkingDirectory ?? ProjectRoot(binding.Project));
             var path = Path.GetFullPath(Path.IsPathFullyQualified(requested)
                 ? requested : Path.Combine(root, requested));
-            if (!IsWithinProject(path, root)) return null;
-            var relative = Path.GetRelativePath(root, path);
-            var cursor = root;
+            var home = Environment.GetEnvironmentVariable("CODEX_HOME");
+            if (string.IsNullOrWhiteSpace(home))
+                home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
+            var allowedRoots = new[] { root, Path.Combine(home, "generated_images"),
+                Path.Combine(home, "visualizations"), Path.Combine(home, "playwright-mcp-output"),
+                Path.Combine(home, "browser") };
+            var allowedRoot = allowedRoots.FirstOrDefault(candidate => IsWithinProject(path, candidate));
+            if (allowedRoot == null) return null;
+            var relative = Path.GetRelativePath(allowedRoot, path);
+            var cursor = allowedRoot;
             foreach (var segment in relative.Split(
                 new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
                 StringSplitOptions.RemoveEmptyEntries))
@@ -1864,6 +1860,7 @@ public sealed class Worker : BackgroundService
         if (!_store.State.Topics.TryGetValue(run.Address.Key, out var binding)) return;
         var candidates = FileLink.Matches(run.Answer)
             .Cast<Match>().Select(match => match.Groups["path"].Value)
+            .Concat(run.ViewedFiles)
             .Concat(run.Files.Order(StringComparer.OrdinalIgnoreCase));
         var files = candidates.Select(path => ResolveRequestedFile(binding, path))
             .Where(path => path != null && File.Exists(path))
@@ -1898,7 +1895,8 @@ public sealed class Worker : BackgroundService
         var root = Path.GetFullPath(binding.WorkingDirectory ?? ProjectRoot(binding.Project));
         var lines = visible.Select((entry, position) =>
             (position + 1).ToString("00") + "  <code>" +
-            H(Clip(Path.GetRelativePath(root, entry.Path), 180)) + "</code>");
+            H(Clip(IsWithinProject(entry.Path, root)
+                ? Path.GetRelativePath(root, entry.Path) : entry.Path, 180)) + "</code>");
         var token = FileListToken(files);
         var buttons = visible.Select(entry => new[]
         {
@@ -1944,9 +1942,26 @@ public sealed class Worker : BackgroundService
                 return;
             }
             await using var stream = File.OpenRead(path);
+            var filename = Path.GetFileName(path);
+            var image = new[] { ".png", ".jpg", ".jpeg", ".webp" }
+                .Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
+            if (image && size <= 10_000_000)
+            {
+                try
+                {
+                    await _bot.SendPhoto(address.ChatId, InputFile.FromStream(stream, filename),
+                        caption: Clip(filename, 800), messageThreadId: address.TopicId, cancellationToken: ct);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Could not send photo; retrying as document");
+                    stream.Position = 0;
+                }
+            }
             await _bot.SendDocument(address.ChatId,
-                InputFile.FromStream(stream, Path.GetFileName(path)),
-                caption: Clip(Path.GetFileName(path), 800),
+                InputFile.FromStream(stream, filename),
+                caption: Clip(filename, 800),
                 messageThreadId: address.TopicId, cancellationToken: ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
@@ -1955,57 +1970,6 @@ public sealed class Worker : BackgroundService
             _log.LogWarning(ex, "Could not send requested file {Path}", path);
             await Send(address, "Не удалось отправить файл: " + ex.Message, ct);
         }
-    }
-
-    private static readonly Regex ImageLink = new(
-        @"!\[[^\]]*\]\((?:<(?<path>[^>]+)>|(?<path>[^)]+))\)",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
-
-    private async Task SendReferencedImages(TopicAddress address, TopicBinding binding,
-        string text, HashSet<string> sent, CancellationToken ct)
-    {
-        foreach (Match match in ImageLink.Matches(text))
-        {
-            if (sent.Count >= 6) break;
-            var target = match.Groups["path"].Value.Trim();
-            var altStart = match.Value.IndexOf(']');
-            var caption = altStart > 2 ? match.Value[2..altStart] : "Изображение";
-            await SendLocalImage(address, binding, target, caption, sent, ct);
-        }
-    }
-
-    private async Task SendLocalImage(TopicAddress address, TopicBinding binding,
-        string target, string caption, HashSet<string> sent, CancellationToken ct)
-    {
-        if (sent.Count >= 6 || string.IsNullOrWhiteSpace(target) ||
-            Uri.TryCreate(target, UriKind.Absolute, out var remote) &&
-            remote.Scheme is "http" or "https") return;
-        try
-        {
-            target = Uri.UnescapeDataString(target.Trim('<', '>'));
-            var basePath = binding.WorkingDirectory ?? ProjectRoot(binding.Project);
-            var full = Path.GetFullPath(Path.IsPathFullyQualified(target)
-                ? target : Path.Combine(basePath, target));
-            var home = Environment.GetEnvironmentVariable("CODEX_HOME");
-            if (string.IsNullOrWhiteSpace(home))
-                home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
-            var allowed = IsWithinProject(full, basePath) ||
-                new[] { "generated_images", "visualizations", "playwright-mcp-output", "browser" }
-                    .Any(folder => IsWithinProject(full, Path.Combine(home, folder)));
-            if (!allowed || !File.Exists(full) || !new[] { ".png", ".jpg", ".jpeg", ".webp", ".gif" }
-                .Contains(Path.GetExtension(full), StringComparer.OrdinalIgnoreCase) ||
-                new FileInfo(full).Length > 20_000_000 || sent.Contains(full)) return;
-            await using var stream = File.OpenRead(full);
-            if (Path.GetExtension(full).Equals(".gif", StringComparison.OrdinalIgnoreCase) ||
-                stream.Length > 10_000_000)
-                await _bot.SendDocument(address.ChatId, InputFile.FromStream(stream, Path.GetFileName(full)),
-                    caption: Clip(caption, 800), messageThreadId: address.TopicId, cancellationToken: ct);
-            else
-                await _bot.SendPhoto(address.ChatId, InputFile.FromStream(stream, Path.GetFileName(full)),
-                    caption: Clip(caption, 800), messageThreadId: address.TopicId, cancellationToken: ct);
-            sent.Add(full);
-        }
-        catch (Exception ex) { _log.LogWarning(ex, "Could not send referenced image {Path}", target); }
     }
 
     private async Task SaveTrace(Run run)
@@ -2290,7 +2254,7 @@ public sealed class Worker : BackgroundService
         public string OutputTail { get; set; } = "";
         public string LastPlan { get; set; } = "";
         public TurnTrace Trace { get; } = new();
-        public HashSet<string> SentImages { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> ViewedFiles { get; } = new(StringComparer.OrdinalIgnoreCase);
         public string Error { get; set; } = "";
         public HashSet<string> Files { get; } = new(StringComparer.OrdinalIgnoreCase);
         public List<string> Tests { get; } = new();
