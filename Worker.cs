@@ -1935,14 +1935,14 @@ public sealed class Worker : BackgroundService
         }
         try
         {
-            var size = new FileInfo(path).Length;
+            await using var stream = File.OpenRead(path);
+            var size = stream.Length;
+            var filename = Path.GetFileName(path);
             if (size > 49_000_000)
             {
-                await Send(address, "Файл больше 49 МБ. Уменьшите его или разделите на части.", ct);
+                await SendFileParts(address, stream, filename, ct);
                 return;
             }
-            await using var stream = File.OpenRead(path);
-            var filename = Path.GetFileName(path);
             var image = new[] { ".png", ".jpg", ".jpeg", ".webp" }
                 .Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
             if (image && size <= 10_000_000)
@@ -1972,6 +1972,41 @@ public sealed class Worker : BackgroundService
         }
     }
 
+    private async Task SendFileParts(TopicAddress address, FileStream stream, string filename, CancellationToken ct)
+    {
+        const int partSize = 49_000_000;
+        var partCount = (stream.Length + partSize - 1) / partSize;
+        var digits = Math.Max(3, partCount.ToString(CultureInfo.InvariantCulture).Length);
+        var partBase = Clip(filename, 160);
+        var buffer = new byte[partSize];
+        for (long index = 1; index <= partCount; index++)
+        {
+            var count = (int)Math.Min(partSize, stream.Length - stream.Position);
+            await stream.ReadExactlyAsync(buffer.AsMemory(0, count), ct);
+            using var part = new MemoryStream(buffer, 0, count, writable: false);
+            var partName = partBase + ".part" + index.ToString("D" + digits, CultureInfo.InvariantCulture);
+            try
+            {
+                await _bot.SendDocument(address.ChatId, InputFile.FromStream(part, partName),
+                    caption: $"{filename} · часть {index}/{partCount}",
+                    messageThreadId: address.TopicId, cancellationToken: ct);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                throw new IOException($"Отправлено {index - 1}/{partCount} частей. Повторите /file для новой попытки.", ex);
+            }
+        }
+        var escapedBase = partBase.Replace("'", "''");
+        var escapedName = filename.Replace("'", "''");
+        var command = "$n='" + escapedBase + "'; " +
+            "$p=@(Get-ChildItem -File | Where-Object { $_.Name.StartsWith($n+'.part',[StringComparison]::Ordinal) } | Sort-Object Name); " +
+            "if($p.Count -ne " + partCount + "){throw 'Не все части скачаны'}; " +
+            "$o=[IO.File]::Create('" + escapedName + "'); try { foreach($x in $p) { " +
+            "$s=[IO.File]::OpenRead($x.FullName); try { $s.CopyTo($o) } finally { $s.Dispose() } " +
+            "} } finally { $o.Dispose() }";
+        await SendUi(address, $"<b>Все {partCount} частей отправлены</b>\n" +
+            "Сохраните их в одну папку и выполните в ней PowerShell:\n<pre>" + H(command) + "</pre>", ct);
+    }
     private async Task SaveTrace(Run run)
     {
         _store.State.LastTurnLogs[run.Address.Key] = run.Trace.FullText;
