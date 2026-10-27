@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using Telegram.Bot;
 using Telegram.Bot.Types;
@@ -173,14 +174,15 @@ public sealed class Worker : BackgroundService
             case "/menu":
                 if (address.IsGeneral) await ShowGeneralMenu(address, null, ct);
                 else await SendUi(address,
-                    "<b>Рабочая тема</b>\n<i>Чат Codex</i>\n\n" +
+                    "<b>Рабочая тема</b>\n\n" +
                     "<blockquote>Напишите задачу. Пока Codex работает, новое сообщение уточнит её; отдельную задачу отправьте через /queue.</blockquote>\n\n" +
                     "<b>Управление</b>\n" +
                     "<code>/status</code>  Информация о чате\n" +
                     "<code>/last</code>  Последний ответ\n" +
                     "<code>/log</code>  Журнал задачи\n" +
+                    "<code>/model</code>  Выбор модели\n" +
                     "<code>/fork</code>  Ветка чата\n" +
-                    "<code>/usage</code>  Лимиты Codex\n" +
+                    "<code>/usage</code>  Лимиты\n" +
                     "<code>/steer</code>  Уточнить текущую задачу\n" +
                     "<code>/queue</code>  Следующая задача\n" +
                     "<code>/stop</code>  Остановить задачу", ct, TopicButtons());
@@ -269,13 +271,16 @@ public sealed class Worker : BackgroundService
                 else
                     await SendUi(address, $"<b>{(_run?.Address == address ? "Задача выполняется" : "Чат готов")}</b>\n" +
                         $"<i>{H(ProjectLabel(binding.Project))}</i>\n\n" +
-                        $"<b>Модель</b>  {H(_run?.Address == address ? _run.Model : ThreadModel.Resolve(binding.ThreadId))}\n" +
+                        $"<b>Модель</b>  {H(_run?.Address == address ? _run.Model : await ResolveModel(binding, ct))}\n" +
                         $"<b>В очереди</b>  {_store.State.PendingTasks.Count(task => task.ChatId == address.ChatId && task.TopicId == address.TopicId)}\n\n" +
                         "<b>Последний ответ</b>\n" + AnswerBlock(await LastAnswer(binding.ThreadId, ct), 2100) +
                         "\n\n<blockquote expandable><b>Привязка</b>\n" +
                         $"Thread: {H(binding.ThreadId)}\n" +
                         $"Каталог: {H(binding.WorkingDirectory ?? ProjectRoot(binding.Project))}</blockquote>",
                         ct, TopicButtons());
+                break;
+            case "/model":
+                await ModelCommand(address, arg, ct);
                 break;
             case "/usage":
                 await SendUi(address, await UsageMarkup(ct), ct,
@@ -346,7 +351,7 @@ public sealed class Worker : BackgroundService
         },
         new[]
         {
-            InlineKeyboardButton.WithCallbackData("Лимиты Codex", "g:u")
+            InlineKeyboardButton.WithCallbackData("Лимиты", "g:u")
         }
     });
 
@@ -373,7 +378,95 @@ public sealed class Worker : BackgroundService
             $"<b>{topics}</b> рабочих тем  ·  <b>{_options.Projects.Count}</b> проектов\n" +
             $"<b>{queued}</b> задач в очереди\n\n" +
             $"<b>Сейчас</b>  {(active == "нет" ? "свободен" : "задача в " + active)}\n\n" +
-            "<blockquote>Лимиты и токены аккаунта — в разделе «Лимиты Codex».</blockquote>";
+            "<blockquote>Лимиты и токены аккаунта — в разделе «Лимиты».</blockquote>";
+    }
+
+    private async Task<string> ResolveModel(TopicBinding binding, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(binding.Model)) return binding.Model;
+        var fromThread = ThreadModel.ReadLastModel(binding.ThreadId);
+        if (!string.IsNullOrWhiteSpace(fromThread)) return fromThread;
+        try
+        {
+            var response = await _server!.CallAsync("config/read", new { includeLayers = false }, ct);
+            if (response.TryGetProperty("config", out var config))
+            {
+                var configured = GetString(config, "model");
+                if (configured.Length > 0) return configured + " (по умолчанию)";
+            }
+        }
+        catch (Exception ex) { _log.LogWarning(ex, "Could not read effective model configuration"); }
+        try
+        {
+            var models = await _server!.CallAsync("model/list", new { limit = 100 }, ct);
+            if (models.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
+            {
+                var selected = data.EnumerateArray().FirstOrDefault(item =>
+                    item.TryGetProperty("isDefault", out var flag) && flag.ValueKind == JsonValueKind.True);
+                var fallback = selected.ValueKind == JsonValueKind.Object
+                    ? GetString(selected, "model") : "";
+                if (fallback.Length > 0) return fallback + " (по умолчанию)";
+            }
+        }
+        catch (Exception ex) { _log.LogWarning(ex, "Could not list models"); }
+        return "не удалось определить";
+    }
+
+    private async Task ModelCommand(TopicAddress address, string argument, CancellationToken ct)
+    {
+        if (address.IsGeneral || !_store.State.Topics.TryGetValue(address.Key, out var binding))
+        {
+            await Send(address, "Выбор модели доступен в рабочей теме.", ct);
+            return;
+        }
+        if (argument.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        {
+            _store.State.Topics[address.Key] = binding with { Model = null };
+            await _store.SaveAsync();
+            await Send(address, "Выбор модели сброшен. Следующая задача унаследует модель чата или конфигурации.", ct);
+            return;
+        }
+        JsonElement[] available;
+        try
+        {
+            var result = await _server!.CallAsync("model/list",
+                new { limit = 100, includeHidden = false }, ct);
+            available = result.GetProperty("data").EnumerateArray().Select(x => x.Clone()).ToArray();
+        }
+        catch (Exception ex)
+        {
+            await Send(address, "Не удалось получить список моделей: " + ex.Message, ct);
+            return;
+        }
+        if (argument.Length == 0)
+        {
+            var current = await ResolveModel(binding, ct);
+            var lines = available.Take(30).Select(item =>
+            {
+                var id = GetString(item, "model");
+                var display = GetString(item, "displayName");
+                return "<code>" + H(id) + "</code>" +
+                    (display.Length > 0 && display != id ? "  " + H(display) : "");
+            });
+            await SendUi(address, "<b>Модель</b>  " + H(current) +
+                "\n\n" + string.Join("\n", lines) +
+                "\n\n<code>/model ID</code> — выбрать для следующих задач\n" +
+                "<code>/model auto</code> — наследовать модель чата", ct);
+            return;
+        }
+        var choice = available.FirstOrDefault(item =>
+            string.Equals(GetString(item, "model"), argument, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(GetString(item, "id"), argument, StringComparison.OrdinalIgnoreCase));
+        if (choice.ValueKind != JsonValueKind.Object)
+        {
+            await Send(address, "Модель отсутствует в списке. Откройте /model.", ct);
+            return;
+        }
+        var model = GetString(choice, "model");
+        _store.State.Topics[address.Key] = binding with { Model = model };
+        await _store.SaveAsync();
+        await Send(address, "Модель для следующих задач: " + model +
+            (_run?.Address == address ? ". Текущая задача продолжит работу на прежней модели." : "."), ct);
     }
 
     private async Task<string> UsageMarkup(CancellationToken ct)
@@ -383,20 +476,20 @@ public sealed class Worker : BackgroundService
             var account = await _server!.CallAsync("account/read", new { refreshToken = false }, ct);
             if (!account.TryGetProperty("account", out var identity) ||
                 identity.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
-                return "<b>Лимиты Codex</b>\n\nCodex App Server не авторизован. " +
+                return "<b>Лимиты</b>\n\nCodex App Server не авторизован. " +
                     "Войдите в ChatGPT через <code>codex login</code> на компьютере с ботом.";
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Could not read Codex account");
-            return "<b>Лимиты Codex</b>\n\nНе удалось проверить авторизацию: " +
+            return "<b>Лимиты</b>\n\nНе удалось проверить авторизацию: " +
                 H(Clip(ex.Message, 180));
         }
         var limitsTask = RateLimitsMarkup(ct);
         var tokensTask = TokenUsageMarkup(ct);
         await Task.WhenAll(limitsTask, tokensTask);
-        return "<b>Лимиты Codex</b>\n<i>Аккаунт и использование</i>\n\n" +
+        return "<b>Лимиты</b>\n\n" +
             limitsTask.Result + "\n\n" + tokensTask.Result;
     }
 
@@ -956,7 +1049,7 @@ public sealed class Worker : BackgroundService
         if (load.Error is { } loadError) return loadError;
         _store.State.Topics[address.Key] = new TopicBinding(project, GetString(thread, "id"), actual);
         await _store.SaveAsync();
-        return $"Topic закреплён за проектом {project}\nThread: {threadId}\nПоследний ответ Codex:\n{Clip(await LastAnswer(threadId, ct), 3000)}";
+        return $"Topic закреплён за проектом {project}\nThread: {threadId}\nПоследний ответ:\n{Clip(await LastAnswer(threadId, ct), 3000)}";
     }
 
     private async Task<string> LinkThreadTopic(long chatId, string project, ThreadChoice choice, CancellationToken ct)
@@ -971,14 +1064,14 @@ public sealed class Worker : BackgroundService
             return "Thread больше не относится к выбранному проекту.";
         var load = await LoadThread(path, choice.Id, ct);
         if (load.Error is { } loadError)
-            return loadError + "\nПоследний ответ Codex:\n" +
+            return loadError + "\nПоследний ответ:\n" +
                 Clip(await LastAnswer(choice.Id, ct), 3000);
         var title = GetString(thread, "name");
         if (title.Length == 0) title = GetString(thread, "preview");
         if (title.Length == 0) title = choice.Title;
         var lastAnswer = await LastAnswer(choice.Id, ct);
         var created = await CreateTopicAndBind(chatId, project, choice.Id, title, path, ct,
-            $"Последний ответ Codex:\n{Clip(lastAnswer, 3000)}");
+            $"Последний ответ:\n{Clip(lastAnswer, 3000)}");
         return created.Summary;
     }
 
@@ -1025,7 +1118,7 @@ public sealed class Worker : BackgroundService
         {
             created = await CreateTopicAndBind(sourceAddress.ChatId, binding.Project, id,
                 title + " · ветка", path, ct,
-                $"Ветка от thread: {binding.ThreadId}\nПоследний ответ Codex до ветвления:\n{Clip(DescribeLastAnswer(turns), 2800)}");
+                $"Ветка от thread: {binding.ThreadId}\nПоследний ответ до ветвления:\n{Clip(DescribeLastAnswer(turns), 2800)}");
         }
         catch (Exception ex)
         {
@@ -1173,17 +1266,22 @@ public sealed class Worker : BackgroundService
     private async Task SendLastAnswer(TopicAddress address, string threadId, CancellationToken ct)
     {
         var answer = await LastAnswer(threadId, ct);
-        var markup = "<b>Последний ответ</b>\n<i>Codex · завершённая задача</i>\n\n" +
+        var markup = "<b>Последний ответ</b>\n\n" +
             TelegramMarkup.RenderAnswer(answer);
         if (markup.Length <= 3900)
         {
             await SendUi(address, markup, ct);
+            if (_store.State.Topics.TryGetValue(address.Key, out var binding))
+                await SendReferencedImages(address, binding, answer, new HashSet<string>(StringComparer.OrdinalIgnoreCase), ct);
             return;
         }
         await using var stream = new MemoryStream(Encoding.UTF8.GetBytes(answer));
         await _bot.SendDocument(address.ChatId, InputFile.FromStream(stream, "last-answer.txt"),
-            caption: "Последний ответ Codex", messageThreadId: address.TopicId,
+            caption: "Последний ответ", messageThreadId: address.TopicId,
             cancellationToken: ct);
+        if (_store.State.Topics.TryGetValue(address.Key, out var longBinding))
+            await SendReferencedImages(address, longBinding, answer,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase), ct);
     }
 
     private static string DescribeLastAnswer(JsonElement[] turns)
@@ -1338,7 +1436,7 @@ public sealed class Worker : BackgroundService
         }
         var run = new Run(address, binding.Project, binding.ThreadId)
         {
-            Model = ThreadModel.Resolve(binding.ThreadId)
+            Model = await ResolveModel(binding, ct)
         };
         run.Trace.Add("Задача отправлена в Codex");
         _run = run;
@@ -1346,8 +1444,11 @@ public sealed class Worker : BackgroundService
         {
             run.StatusMessageId = await TaskStatus(address, statusMessageId, "Выполняется", ct);
             run.StatusText = TaskStatusMarkup("Выполняется");
-            var result = await _server!.CallAsync("turn/start", new { threadId = binding.ThreadId,
-                input = new[] { new { type = "text", text } } }, ct);
+            var turnInput = new[] { new { type = "text", text } };
+            var parameters = string.IsNullOrWhiteSpace(binding.Model)
+                ? (object)new { threadId = binding.ThreadId, input = turnInput }
+                : new { threadId = binding.ThreadId, input = turnInput, model = binding.Model };
+            var result = await _server!.CallAsync("turn/start", parameters, ct);
             run.TurnId = result.GetProperty("turn").GetProperty("id").GetString();
             run.Trace.Add("Turn запущен");
             await SetStatus(run, "Выполняется", ct, force: true);
@@ -1440,6 +1541,7 @@ public sealed class Worker : BackgroundService
                     disconnectedRun.Trace.Add("Последний вывод команды", disconnectedRun.OutputTail);
                 disconnectedRun.Trace.Add("Соединение оборвалось", disconnectedRun.Error);
                 _run = null;
+                await CloseApprovals(disconnectedRun, ct);
                 await SaveTrace(disconnectedRun);
                 await Complete(disconnectedRun, "failed", disconnectedRun.Error, ct);
             }
@@ -1499,9 +1601,22 @@ public sealed class Worker : BackgroundService
             case "item/completed":
                 item = p.GetProperty("item");
                 var type = GetString(item, "type");
-                if (type == "agentMessage" &&
-                    GetString(item, "phase") is "final_answer" or "")
-                    run.Answer = GetString(item, "text");
+                if (type == "agentMessage")
+                {
+                    var messageText = GetString(item, "text");
+                    if (GetString(item, "phase") is "final_answer" or "")
+                        run.Answer = messageText;
+                    if (messageText.Length > 0 &&
+                        _store.State.Topics.TryGetValue(run.Address.Key, out var mediaBinding))
+                        await SendReferencedImages(run.Address, mediaBinding, messageText,
+                            run.SentImages, ct);
+                }
+                else if (type == "imageView")
+                {
+                    if (_store.State.Topics.TryGetValue(run.Address.Key, out var imageBinding))
+                        await SendLocalImage(run.Address, imageBinding, GetString(item, "path"),
+                            "Просмотрено во время работы", run.SentImages, ct);
+                }
                 else if (type == "commandExecution")
                 {
                     var command = GetString(item, "command");
@@ -1562,6 +1677,7 @@ public sealed class Worker : BackgroundService
                 if (toModel.Length > 0)
                 {
                     run.Model = toModel;
+                    run.ModelRerouted = true;
                     run.Trace.Add("Модель переключена", toModel + " · " + GetString(p, "reason"));
                     await SetStatus(run, "Модель переключена", ct, force: true);
                 }
@@ -1572,11 +1688,13 @@ public sealed class Worker : BackgroundService
                 break;
             case "turn/completed":
                 var turn = p.GetProperty("turn");
-                run.Model = ThreadModel.Resolve(run.ThreadId);
+                if (!run.ModelRerouted && _store.State.Topics.TryGetValue(run.Address.Key, out var currentBinding))
+                    run.Model = await ResolveModel(currentBinding, ct);
                 run.Trace.Add("Turn завершён", GetString(turn, "status"));
                 _run = null;
                 try
                 {
+                    await CloseApprovals(run, ct);
                     await SaveTrace(run);
                     await Complete(run, GetString(turn, "status"),
                         turn.TryGetProperty("error", out var err) ? GetString(err, "message") : run.Error, ct);
@@ -1629,23 +1747,16 @@ public sealed class Worker : BackgroundService
             text += "\n\n<blockquote expandable><b>Ход работы · " + run.Trace.Entries.Count + "</b>\n" +
                 H(run.Trace.Recent(900)) + "</blockquote>\n<i>Полный журнал: /log</i>";
         if (pending.Length > 0)
-            text += "\n\n<b>Нужно подтверждение</b>\n<blockquote expandable>" +
-                string.Join("\n\n", pending.Take(4).Select(x => H(Clip(x.Value.Detail, 400)))) +
-                "</blockquote>";
+            text += "\n\n<b>Ожидаю разрешения</b>\nОтветьте в отдельном сообщении с кнопками.";
         if (text.Length > 3900)
             text = TaskStatusMarkup(Clip(progress, 500)) + "\n<b>Модель</b>  " + H(run.Model) +
                 "\n<i>Подробности: /log</i>";
-        if (text == run.StatusText && pending.Length == 0) return true;
-        var buttons = pending.Select(x => new[]
-        {
-            InlineKeyboardButton.WithCallbackData("Разрешить", $"a:{x.Key}:y"),
-            InlineKeyboardButton.WithCallbackData("Отклонить", $"a:{x.Key}:n")
-        }).ToArray();
+        if (text == run.StatusText) return true;
         try
         {
             await _bot.EditMessageText(run.Address.ChatId, run.StatusMessageId, text,
                 parseMode: ParseMode.Html,
-                replyMarkup: buttons.Length == 0 ? null : new InlineKeyboardMarkup(buttons), cancellationToken: ct);
+                cancellationToken: ct);
             run.StatusText = text;
             run.LastStatusAt = DateTime.UtcNow;
             return true;
@@ -1666,7 +1777,7 @@ public sealed class Worker : BackgroundService
         if (!string.IsNullOrWhiteSpace(failure)) details.Add("Ошибка: " + failure);
         if (run.Tests.Count > 0) details.Add("Проверки: " + string.Join("; ", run.Tests));
         if (run.Files.Count > 0) details.Add("Файлы: " + string.Join(", ", run.Files.Order()));
-        var markup = $"<b>{H(title)}</b>\n<i>Ответ Codex</i>\n\n" +
+        var markup = $"<b>{H(title)}</b>\n" +
             "<b>Модель</b>  " + H(run.Model) + "\n\n" + TelegramMarkup.RenderAnswer(answer);
         if (details.Count > 0)
             markup += "\n\n<blockquote expandable><b>Детали выполнения</b>\n" +
@@ -1680,6 +1791,59 @@ public sealed class Worker : BackgroundService
             await _bot.SendDocument(run.Address.ChatId, InputFile.FromStream(stream, "answer.txt"),
                 caption: title, messageThreadId: run.Address.TopicId, cancellationToken: ct);
         }
+        if (_store.State.Topics.TryGetValue(run.Address.Key, out var binding))
+            await SendReferencedImages(run.Address, binding, answer, run.SentImages, ct);
+    }
+
+    private static readonly Regex ImageLink = new(
+        @"!\[[^\]]*\]\((?:<(?<path>[^>]+)>|(?<path>[^)]+))\)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+
+    private async Task SendReferencedImages(TopicAddress address, TopicBinding binding,
+        string text, HashSet<string> sent, CancellationToken ct)
+    {
+        foreach (Match match in ImageLink.Matches(text))
+        {
+            if (sent.Count >= 6) break;
+            var target = match.Groups["path"].Value.Trim();
+            var altStart = match.Value.IndexOf(']');
+            var caption = altStart > 2 ? match.Value[2..altStart] : "Изображение";
+            await SendLocalImage(address, binding, target, caption, sent, ct);
+        }
+    }
+
+    private async Task SendLocalImage(TopicAddress address, TopicBinding binding,
+        string target, string caption, HashSet<string> sent, CancellationToken ct)
+    {
+        if (sent.Count >= 6 || string.IsNullOrWhiteSpace(target) ||
+            Uri.TryCreate(target, UriKind.Absolute, out var remote) &&
+            remote.Scheme is "http" or "https") return;
+        try
+        {
+            target = Uri.UnescapeDataString(target.Trim('<', '>'));
+            var basePath = binding.WorkingDirectory ?? ProjectRoot(binding.Project);
+            var full = Path.GetFullPath(Path.IsPathFullyQualified(target)
+                ? target : Path.Combine(basePath, target));
+            var home = Environment.GetEnvironmentVariable("CODEX_HOME");
+            if (string.IsNullOrWhiteSpace(home))
+                home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
+            var allowed = IsWithinProject(full, basePath) ||
+                new[] { "generated_images", "visualizations", "playwright-mcp-output", "browser" }
+                    .Any(folder => IsWithinProject(full, Path.Combine(home, folder)));
+            if (!allowed || !File.Exists(full) || !new[] { ".png", ".jpg", ".jpeg", ".webp", ".gif" }
+                .Contains(Path.GetExtension(full), StringComparer.OrdinalIgnoreCase) ||
+                new FileInfo(full).Length > 20_000_000 || sent.Contains(full)) return;
+            await using var stream = File.OpenRead(full);
+            if (Path.GetExtension(full).Equals(".gif", StringComparison.OrdinalIgnoreCase) ||
+                stream.Length > 10_000_000)
+                await _bot.SendDocument(address.ChatId, InputFile.FromStream(stream, Path.GetFileName(full)),
+                    caption: Clip(caption, 800), messageThreadId: address.TopicId, cancellationToken: ct);
+            else
+                await _bot.SendPhoto(address.ChatId, InputFile.FromStream(stream, Path.GetFileName(full)),
+                    caption: Clip(caption, 800), messageThreadId: address.TopicId, cancellationToken: ct);
+            sent.Add(full);
+        }
+        catch (Exception ex) { _log.LogWarning(ex, "Could not send referenced image {Path}", target); }
     }
 
     private async Task SaveTrace(Run run)
@@ -1717,16 +1881,45 @@ public sealed class Worker : BackgroundService
             return;
         }
         var key = Guid.NewGuid().ToString("N")[..12];
-        var detail = method.Contains("commandExecution")
-            ? $"Команда: {GetString(p, "command")}\nКаталог: {GetString(p, "cwd")}"
-            : method.Contains("permissions")
-                ? $"Разрешения: {p.GetProperty("permissions")}\nПричина: {GetString(p, "reason")}"
-                : $"Изменение файлов. {GetString(p, "reason")}\nRoot: {GetString(p, "grantRoot")}";
-        _approvals[key] = new Approval(id.Clone(), method, _run.ThreadId, _run.TurnId ?? "", detail,
-            p.TryGetProperty("permissions", out var requested) ? requested.Clone() : default);
-        if (!await SetStatus(_run, "Ожидание подтверждения", ct, force: true))
+        var network = p.TryGetProperty("networkApprovalContext", out var context) &&
+            context.ValueKind == JsonValueKind.Object ? context : default;
+        var detail = network.ValueKind == JsonValueKind.Object
+            ? "Доступ к сети: " + GetString(network, "host") +
+                "\nПротокол: " + GetString(network, "protocol")
+            : method.Contains("commandExecution")
+                ? "Команда: " + GetString(p, "command") +
+                    "\nКаталог: " + GetString(p, "cwd") +
+                    "\nПричина: " + GetString(p, "reason")
+                : method.Contains("permissions")
+                    ? "Разрешения: " + p.GetProperty("permissions") +
+                        "\nПричина: " + GetString(p, "reason")
+                    : "Изменение файлов. " + GetString(p, "reason") +
+                        "\nКаталог: " + GetString(p, "grantRoot");
+        var buttons = new InlineKeyboardMarkup(new[]
         {
-            _approvals.Remove(key);
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("Разрешить", "a:" + key + ":y"),
+                InlineKeyboardButton.WithCallbackData("Отклонить", "a:" + key + ":n")
+            }
+        });
+        try
+        {
+            var message = await _bot.SendMessage(_run.Address.ChatId,
+                "<b>Нужно разрешение</b>\n\n<pre>" + H(Clip(detail, 3000)) +
+                "</pre>\n\nВыберите действие ниже.",
+                messageThreadId: _run.Address.TopicId, parseMode: ParseMode.Html,
+                replyMarkup: buttons, cancellationToken: ct);
+            _approvals[key] = new Approval(id.Clone(), method, _run.ThreadId,
+                _run.TurnId ?? "", detail,
+                p.TryGetProperty("permissions", out var requested) ? requested.Clone() : default,
+                message.MessageId);
+            _run.Trace.Add("Ожидание разрешения", Clip(detail, 800));
+            await SetStatus(_run, "Ожидаю разрешения в отдельном сообщении", ct, force: true);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Could not deliver approval request");
             if (method == "item/permissions/requestApproval")
                 await _server!.RespondAsync(id, new { permissions = new { }, scope = "turn" }, ct);
             else await _server!.RespondAsync(id, new { decision = "decline" }, ct);
@@ -1736,20 +1929,53 @@ public sealed class Worker : BackgroundService
     private async Task HandleApproval(CallbackQuery callback, TopicAddress address, string[] parts, CancellationToken ct)
     {
         if (!_approvals.TryGetValue(parts[1], out var approval) || _run?.Address != address ||
-            callback.Message?.MessageId != _run.StatusMessageId || approval.ThreadId != _run.ThreadId)
+            callback.Message?.MessageId != approval.MessageId || approval.ThreadId != _run.ThreadId)
         {
             await _bot.AnswerCallbackQuery(callback.Id, "Запрос уже закрыт.", cancellationToken: ct);
             return;
         }
-        _approvals.Remove(parts[1]);
         var accepted = parts[2] == "y" && !_run.Stopping &&
             (approval.TurnId.Length == 0 || _run.TurnId == approval.TurnId);
-        if (approval.Method == "item/permissions/requestApproval")
-            await _server!.RespondAsync(approval.Id,
-                new { permissions = accepted ? (object)approval.Permissions : new { }, scope = "turn" }, ct);
-        else await _server!.RespondAsync(approval.Id, new { decision = accepted ? "accept" : "decline" }, ct);
-        await _bot.AnswerCallbackQuery(callback.Id, accepted ? "Разрешено" : "Отклонено", cancellationToken: ct);
-        await SetStatus(_run, "Выполняется", ct, force: true);
+        try
+        {
+            if (approval.Method == "item/permissions/requestApproval")
+                await _server!.RespondAsync(approval.Id,
+                    new { permissions = accepted ? (object)approval.Permissions : new { }, scope = "turn" }, ct);
+            else await _server!.RespondAsync(approval.Id,
+                    new { decision = accepted ? "accept" : "decline" }, ct);
+            _approvals.Remove(parts[1]);
+            await _bot.AnswerCallbackQuery(callback.Id,
+                accepted ? "Разрешено" : "Отклонено", cancellationToken: ct);
+            await CloseApprovalMessage(address, approval, accepted ? "Разрешено" : "Отклонено", ct);
+            _run.Trace.Add("Решение пользователя", accepted ? "Разрешено" : "Отклонено");
+            await SetStatus(_run, "Выполняется", ct, force: true);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Could not answer approval request");
+            await _bot.AnswerCallbackQuery(callback.Id,
+                "Не удалось передать решение. Повторите нажатие.", cancellationToken: ct);
+        }
+    }
+
+    private async Task CloseApprovalMessage(TopicAddress address, Approval approval, string state, CancellationToken ct)
+    {
+        try
+        {
+            await _bot.EditMessageText(address.ChatId, approval.MessageId,
+                "<b>" + H(state) + "</b>\n<pre>" + H(Clip(approval.Detail, 3000)) + "</pre>",
+                parseMode: ParseMode.Html, cancellationToken: ct);
+        }
+        catch (Exception ex) { _log.LogWarning(ex, "Could not close approval message"); }
+    }
+
+    private async Task CloseApprovals(Run run, CancellationToken ct)
+    {
+        foreach (var (key, approval) in _approvals.Where(x => x.Value.ThreadId == run.ThreadId).ToArray())
+        {
+            _approvals.Remove(key);
+            await CloseApprovalMessage(run.Address, approval, "Запрос закрыт", ct);
+        }
     }
 
     private async Task Send(TopicAddress address, string text, CancellationToken ct) =>
@@ -1768,7 +1994,7 @@ public sealed class Worker : BackgroundService
         "<blockquote expandable>" + H(Clip(answer, max)) + "</blockquote>";
 
     private static string TaskStatusMarkup(string status) =>
-        "<b>Текущая задача</b>\n<i>Codex</i>\n\n<blockquote>" + H(status) + "</blockquote>";
+        "<b>Текущая задача</b>\n<blockquote>" + H(status) + "</blockquote>";
 
     private async Task<(string? Error, bool Busy)> LoadThread(string directory, string threadId, CancellationToken ct)
     {
@@ -1879,7 +2105,7 @@ public sealed class Worker : BackgroundService
         public int MessageId { get; set; }
     }
     private sealed record Approval(JsonElement Id, string Method, string ThreadId, string TurnId,
-        string Detail, JsonElement Permissions);
+        string Detail, JsonElement Permissions, int MessageId);
     private sealed class Run(TopicAddress address, string project, string threadId)
     {
         public TopicAddress Address { get; } = address;
@@ -1897,10 +2123,12 @@ public sealed class Worker : BackgroundService
         public DateTime LastSilenceWarningAt { get; set; }
         public bool Stopping { get; set; }
         public string Answer { get; set; } = "";
-        public string Model { get; set; } = "не определена";
+        public string Model { get; set; } = "не удалось определить";
+        public bool ModelRerouted { get; set; }
         public string OutputTail { get; set; } = "";
         public string LastPlan { get; set; } = "";
         public TurnTrace Trace { get; } = new();
+        public HashSet<string> SentImages { get; } = new(StringComparer.OrdinalIgnoreCase);
         public string Error { get; set; } = "";
         public HashSet<string> Files { get; } = new(StringComparer.OrdinalIgnoreCase);
         public List<string> Tests { get; } = new();

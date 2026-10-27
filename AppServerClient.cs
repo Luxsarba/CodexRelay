@@ -18,15 +18,17 @@ public sealed class AppServerClient : IAsyncDisposable
     public AppServerClient(ILogger<AppServerClient> log, string executable)
     {
         _log = log;
-        _process = new Process { StartInfo = new ProcessStartInfo(executable, "app-server --listen stdio://")
+        var startInfo = new ProcessStartInfo(executable)
         {
+            ArgumentList = { "app-server", "--listen", "stdio://", "-c", "approvals_reviewer=\"auto_review\"" },
             UseShellExecute = false, RedirectStandardInput = true,
             RedirectStandardOutput = true, RedirectStandardError = true,
             StandardInputEncoding = new UTF8Encoding(false),
             StandardOutputEncoding = new UTF8Encoding(false),
             StandardErrorEncoding = new UTF8Encoding(false),
             CreateNoWindow = true
-        }};
+        };
+        _process = new Process { StartInfo = startInfo };
         if (!_process.Start()) throw new InvalidOperationException("Codex App Server did not start.");
         _ = ReadLoop();
         _ = ReadErrors();

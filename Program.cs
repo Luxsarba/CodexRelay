@@ -32,6 +32,14 @@ if (args.Contains("--check-app-server"))
     using var loggerFactory = LoggerFactory.Create(x => x.AddConsole());
     await using var server = new AppServerClient(loggerFactory.CreateLogger<AppServerClient>(), options.ResolveCodex());
     await server.InitializeAsync(CancellationToken.None);
+    var config = await server.CallAsync("config/read", new { includeLayers = false }, CancellationToken.None);
+    var settings = config.GetProperty("config");
+    Console.WriteLine("Reviewer: " + (settings.TryGetProperty("approvals_reviewer", out var reviewer)
+        ? reviewer.ToString() : "not returned"));
+    Console.WriteLine("Configured model: " + (settings.TryGetProperty("model", out var configured)
+        ? configured.ToString() : "not returned"));
+    var catalog = await server.CallAsync("model/list", new { limit = 100, includeHidden = false }, CancellationToken.None);
+    Console.WriteLine("Available models: " + catalog.GetProperty("data").GetArrayLength());
     var project = options.Projects.Values.FirstOrDefault(Directory.Exists);
     if (project != null)
     {

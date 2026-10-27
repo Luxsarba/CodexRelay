@@ -51,7 +51,7 @@ public sealed class RelayState
 }
 
 public sealed record TopicBinding(string Project, string ThreadId, string? WorkingDirectory = null,
-    string? PendingName = null);
+    string? PendingName = null, string? Model = null);
 public sealed record PendingTask(long ChatId, int TopicId, string Text, int StatusMessageId = 0);
 
 public sealed class StateStore

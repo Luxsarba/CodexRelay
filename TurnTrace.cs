@@ -31,49 +31,36 @@ internal sealed class TurnTrace
 
 internal static class ThreadModel
 {
-    public static string Resolve(string threadId)
+    public static string? ReadLastModel(string threadId)
     {
         try
         {
             var home = Environment.GetEnvironmentVariable("CODEX_HOME");
             if (string.IsNullOrWhiteSpace(home))
                 home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
-            var sessions = Path.Combine(home, "sessions");
-            if (Directory.Exists(sessions))
+            foreach (var folder in new[] { "sessions", "archived_sessions" })
             {
-                var path = Directory.EnumerateFiles(sessions, "*" + threadId + "*.jsonl", SearchOption.AllDirectories)
-                    .FirstOrDefault();
-                if (path != null)
+                var root = Path.Combine(home, folder);
+                if (!Directory.Exists(root)) continue;
+                var path = Directory.EnumerateFiles(root, "*" + threadId + "*.jsonl",
+                    SearchOption.AllDirectories).FirstOrDefault();
+                if (path == null) continue;
+                string? model = null;
+                foreach (var line in File.ReadLines(path))
                 {
-                    string model = "";
-                    string effort = "";
-                    foreach (var line in File.ReadLines(path))
-                    {
-                        if (!line.Contains("turn_context", StringComparison.Ordinal)) continue;
-                        using var doc = JsonDocument.Parse(line);
-                        var root = doc.RootElement;
-                        if (root.TryGetProperty("type", out var type) && type.GetString() == "turn_context" &&
-                            root.TryGetProperty("payload", out var payload))
-                        {
-                            if (payload.TryGetProperty("model", out var m)) model = m.GetString() ?? model;
-                            if (payload.TryGetProperty("effort", out var e)) effort = e.GetString() ?? effort;
-                        }
-                    }
-                    if (model.Length > 0) return effort.Length > 0 ? model + " · " + effort : model;
+                    if (!line.Contains("turn_context", StringComparison.Ordinal)) continue;
+                    using var doc = JsonDocument.Parse(line);
+                    var entry = doc.RootElement;
+                    if (entry.TryGetProperty("type", out var type) &&
+                        type.GetString() == "turn_context" &&
+                        entry.TryGetProperty("payload", out var payload) &&
+                        payload.TryGetProperty("model", out var value))
+                        model = value.GetString() ?? model;
                 }
-            }
-            var config = Path.Combine(home, "config.toml");
-            if (File.Exists(config))
-            {
-                var model = File.ReadLines(config).FirstOrDefault(x => x.TrimStart().StartsWith("model = ", StringComparison.Ordinal));
-                if (model != null)
-                {
-                    var value = model.Split('=', 2)[1].Trim().Trim('"');
-                    if (value.Length > 0) return value + " (по умолчанию)";
-                }
+                if (!string.IsNullOrWhiteSpace(model)) return model;
             }
         }
         catch (Exception) { }
-        return "не определена";
+        return null;
     }
 }
