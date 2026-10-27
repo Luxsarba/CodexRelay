@@ -180,6 +180,8 @@ public sealed class Worker : BackgroundService
                     "<code>/status</code>  Информация о чате\n" +
                     "<code>/last</code>  Последний ответ\n" +
                     "<code>/log</code>  Журнал задачи\n" +
+                    "<code>/files</code>  Файлы последней задачи\n" +
+                    "<code>/file</code>  Получить файл по пути\n" +
                     "<code>/model</code>  Выбор модели\n" +
                     "<code>/fork</code>  Ветка чата\n" +
                     "<code>/usage</code>  Лимиты\n" +
@@ -294,6 +296,12 @@ public sealed class Worker : BackgroundService
                 break;
             case "/log":
                 await SendTrace(address, ct);
+                break;
+            case "/files":
+                await ShowFiles(address, ct);
+                break;
+            case "/file":
+                await SendRequestedFile(address, arg, ct);
                 break;
             case "/fork":
                 if (address.IsGeneral || !_store.State.Topics.TryGetValue(address.Key, out var forkBinding))
@@ -598,6 +606,10 @@ public sealed class Worker : BackgroundService
             InlineKeyboardButton.WithCallbackData("Ответ", "t:l"),
             InlineKeyboardButton.WithCallbackData("Журнал", "t:j"),
             InlineKeyboardButton.WithCallbackData("Ветка", "t:f")
+        },
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("Файлы", "t:files")
         }
     });
 
@@ -1337,12 +1349,25 @@ public sealed class Worker : BackgroundService
             }
             if (parts[1] == "l") await SendLastAnswer(address, binding.ThreadId, ct);
             else if (parts[1] == "j") await SendTrace(address, ct);
+            else if (parts[1] == "files") await ShowFiles(address, ct);
             else if (parts[1] == "f")
             {
                 if (_run?.Address == address)
                     await Send(address, "Дождитесь завершения текущей задачи и повторите.", ct);
                 else await ForkThreadTopic(address, binding, ct);
             }
+            return;
+        }
+        if (parts is { Length: 3 } && parts[0] == "d")
+        {
+            await _bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
+            if (!_store.State.Topics.TryGetValue(address.Key, out var fileBinding) ||
+                !_store.State.LastTurnFiles.TryGetValue(address.Key, out var savedFiles) ||
+                parts[1] != FileListToken(savedFiles) ||
+                !int.TryParse(parts[2], out var fileIndex) ||
+                fileIndex < 0 || fileIndex >= savedFiles.Count)
+                await Send(address, "Список файлов устарел. Откройте /files ещё раз.", ct);
+            else await SendRequestedFile(address, savedFiles[fileIndex], ct);
             return;
         }
         if (parts?.Length == 3 && parts[0] == "a")
@@ -1767,6 +1792,7 @@ public sealed class Worker : BackgroundService
 
     private async Task Complete(Run run, string status, string error, CancellationToken ct)
     {
+        await SaveTurnFiles(run);
         await SetStatus(run, status == "completed" ? "Готово" : "Завершено: " + status, ct, force: true);
         var failure = string.IsNullOrWhiteSpace(error) ? run.Error : error;
         var answer = string.IsNullOrWhiteSpace(run.Answer)
@@ -1793,6 +1819,142 @@ public sealed class Worker : BackgroundService
         }
         if (_store.State.Topics.TryGetValue(run.Address.Key, out var binding))
             await SendReferencedImages(run.Address, binding, answer, run.SentImages, ct);
+    }
+
+    private static readonly Regex FileLink = new(
+        @"!?\[[^\]]+\]\((?:<(?<path>[^>]+)>|(?<path>[^)]+))\)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+
+    private string? ResolveRequestedFile(TopicBinding binding, string requested)
+    {
+        if (string.IsNullOrWhiteSpace(requested)) return null;
+        try
+        {
+            requested = Uri.UnescapeDataString(requested.Trim().Trim('"', '\'', '<', '>'));
+            if (Uri.TryCreate(requested, UriKind.Absolute, out var uri) &&
+                uri.Scheme is "http" or "https") return null;
+            var root = Path.GetFullPath(binding.WorkingDirectory ?? ProjectRoot(binding.Project));
+            var path = Path.GetFullPath(Path.IsPathFullyQualified(requested)
+                ? requested : Path.Combine(root, requested));
+            if (!IsWithinProject(path, root)) return null;
+            var relative = Path.GetRelativePath(root, path);
+            var cursor = root;
+            foreach (var segment in relative.Split(
+                new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                StringSplitOptions.RemoveEmptyEntries))
+            {
+                cursor = Path.Combine(cursor, segment);
+                if ((File.Exists(cursor) || Directory.Exists(cursor)) &&
+                    (File.GetAttributes(cursor) & FileAttributes.ReparsePoint) != 0)
+                    return null;
+            }
+            return path;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException or UriFormatException)
+        {
+            return null;
+        }
+    }
+
+    private static string FileListToken(List<string> files) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join("\n", files))))[..8];
+
+    private async Task SaveTurnFiles(Run run)
+    {
+        if (!_store.State.Topics.TryGetValue(run.Address.Key, out var binding)) return;
+        var candidates = FileLink.Matches(run.Answer)
+            .Cast<Match>().Select(match => match.Groups["path"].Value)
+            .Concat(run.Files.Order(StringComparer.OrdinalIgnoreCase));
+        var files = candidates.Select(path => ResolveRequestedFile(binding, path))
+            .Where(path => path != null && File.Exists(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(50).Cast<string>().ToList();
+        _store.State.LastTurnFiles[run.Address.Key] = files;
+        await _store.SaveAsync();
+    }
+
+    private async Task ShowFiles(TopicAddress address, CancellationToken ct)
+    {
+        if (address.IsGeneral || !_store.State.Topics.TryGetValue(address.Key, out var binding))
+        {
+            await Send(address, "Файлы доступны в рабочей теме.", ct);
+            return;
+        }
+        if (!_store.State.LastTurnFiles.TryGetValue(address.Key, out var files) || files.Count == 0)
+        {
+            await SendUi(address, "<b>Файлы последней задачи</b>\n\n" +
+                "В изменениях и последнем ответе файлов нет. Укажите путь вручную: " +
+                "<code>/file путь/к/файлу</code>", ct);
+            return;
+        }
+        var visible = files.Select((path, index) => (Path: path, Index: index))
+            .Where(entry => ResolveRequestedFile(binding, entry.Path) != null &&
+                File.Exists(entry.Path)).Take(12).ToArray();
+        if (visible.Length == 0)
+        {
+            await Send(address, "Файлы последней задачи больше не найдены. Укажите актуальный путь через /file.", ct);
+            return;
+        }
+        var root = Path.GetFullPath(binding.WorkingDirectory ?? ProjectRoot(binding.Project));
+        var lines = visible.Select((entry, position) =>
+            (position + 1).ToString("00") + "  <code>" +
+            H(Clip(Path.GetRelativePath(root, entry.Path), 180)) + "</code>");
+        var token = FileListToken(files);
+        var buttons = visible.Select(entry => new[]
+        {
+            InlineKeyboardButton.WithCallbackData(
+                Clip(Path.GetFileName(entry.Path), 35), "d:" + token + ":" + entry.Index)
+        }).ToArray();
+        await SendUi(address, "<b>Файлы последней задачи</b>\n\n" +
+            string.Join("\n", lines) +
+            (files.Count > visible.Length ? "\n\nЕщё файлы: <code>/file путь</code>" : "") +
+            "\n\nНажмите на имя файла или отправьте <code>/file путь</code>.",
+            ct, new InlineKeyboardMarkup(buttons));
+    }
+
+    private async Task SendRequestedFile(TopicAddress address, string requested, CancellationToken ct)
+    {
+        if (address.IsGeneral || !_store.State.Topics.TryGetValue(address.Key, out var binding))
+        {
+            await Send(address, "Команда доступна в рабочей теме.", ct);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(requested))
+        {
+            await Send(address, "Формат: /file <путь>. Путь может быть относительным рабочему каталогу.", ct);
+            return;
+        }
+        var path = ResolveRequestedFile(binding, requested);
+        if (path == null)
+        {
+            await Send(address, "Можно получить только файл внутри рабочего каталога темы. Путь или ссылка недопустимы.", ct);
+            return;
+        }
+        if (!File.Exists(path))
+        {
+            await Send(address, "Файл не найден: " + requested, ct);
+            return;
+        }
+        try
+        {
+            var size = new FileInfo(path).Length;
+            if (size > 49_000_000)
+            {
+                await Send(address, "Файл больше 49 МБ. Уменьшите его или разделите на части.", ct);
+                return;
+            }
+            await using var stream = File.OpenRead(path);
+            await _bot.SendDocument(address.ChatId,
+                InputFile.FromStream(stream, Path.GetFileName(path)),
+                caption: Clip(Path.GetFileName(path), 800),
+                messageThreadId: address.TopicId, cancellationToken: ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Could not send requested file {Path}", path);
+            await Send(address, "Не удалось отправить файл: " + ex.Message, ct);
+        }
     }
 
     private static readonly Regex ImageLink = new(
