@@ -33,9 +33,12 @@ public sealed class RelayOptions
             "OpenAI", "Codex", "bin");
         var match = Directory.Exists(root)
             ? Directory.GetFiles(root, "codex.exe", SearchOption.AllDirectories)
+                .Where(path => File.Exists(Path.Combine(Path.GetDirectoryName(path)!, "codex-code-mode-host.exe")))
                 .OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault()
             : null;
-        return match ?? throw new FileNotFoundException("Codex Desktop executable not found. Set Relay:CodexExecutable.");
+        return match ?? throw new FileNotFoundException(
+            "Complete Codex Desktop installation not found (codex.exe and codex-code-mode-host.exe). " +
+            "Set Relay:CodexExecutable for a custom CLI path.");
     }
 }
 

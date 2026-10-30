@@ -27,6 +27,8 @@ public sealed class Worker : BackgroundService
     private readonly Dictionary<long, int> _projectPrompts = new();
     private readonly HashSet<string> _loadedThreads = new();
     private AppServerClient? _server;
+    private string _codexExecutable = "";
+    private DateTime _codexWriteTime;
     private readonly Dictionary<TopicAddress, Run> _runs = new();
     private volatile bool _serverDisconnected;
     private DateTime _lastQueueRetryAt;
@@ -54,18 +56,10 @@ public sealed class Worker : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
         PublishHealth("starting");
-        _server = new AppServerClient(ServerLog, _options.ResolveCodex());
-        _server.Message += msg => { _events.Writer.TryWrite(msg); return Task.CompletedTask; };
-        _server.Disconnected += () =>
-        {
-            _serverDisconnected = true;
-            _events.Writer.TryWrite(JsonSerializer.SerializeToElement(new
-            {
-                method = "relay/disconnected", @params = new { }
-            }));
-            return Task.CompletedTask;
-        };
+        _codexExecutable = _options.ResolveCodex();
+        _server = CreateServer(_codexExecutable);
         await _server.InitializeAsync(ct);
+        _codexWriteTime = File.GetLastWriteTimeUtc(_codexExecutable);
         _ = ProcessEvents(ct);
         await _bot.DeleteWebhook(dropPendingUpdates: false, cancellationToken: ct);
         await StartQueued(ct);
@@ -105,6 +99,7 @@ public sealed class Worker : BackgroundService
                             run.LastSilenceWarningAt = DateTime.UtcNow;
                             await SetStatus(run, "Codex не присылал событий более 2 минут. Соединение проверяется; /log покажет уже выполненное.", ct, force: true);
                         }
+                    await RefreshCodexServer(ct);
                     if (_store.State.PendingTasks.Count > 0 &&
                         DateTime.UtcNow - _lastQueueRetryAt >= TimeSpan.FromSeconds(30))
                         await StartQueued(ct);
@@ -121,6 +116,58 @@ public sealed class Worker : BackgroundService
         }
     }
 
+    private AppServerClient CreateServer(string executable)
+    {
+        var server = new AppServerClient(ServerLog, executable);
+        server.Message += msg => { _events.Writer.TryWrite(msg); return Task.CompletedTask; };
+        server.Disconnected += () =>
+        {
+            if (!ReferenceEquals(_server, server)) return Task.CompletedTask;
+            _serverDisconnected = true;
+            _events.Writer.TryWrite(JsonSerializer.SerializeToElement(new
+            {
+                method = "relay/disconnected", @params = new { }
+            }));
+            return Task.CompletedTask;
+        };
+        return server;
+    }
+
+    private async Task RefreshCodexServer(CancellationToken ct)
+    {
+        if (_runs.Count > 0 || _serverDisconnected) return;
+        string executable;
+        try { executable = _options.ResolveCodex(); }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Could not find installed Codex; keeping current App Server");
+            return;
+        }
+        var writeTime = File.GetLastWriteTimeUtc(executable);
+        if (string.Equals(executable, _codexExecutable, StringComparison.OrdinalIgnoreCase) &&
+            writeTime == _codexWriteTime) return;
+        _log.LogInformation("Codex installation changed; starting new App Server from {Path}", executable);
+        AppServerClient? replacement = null;
+        try
+        {
+            replacement = CreateServer(executable);
+            await replacement.InitializeAsync(ct);
+            var previous = _server;
+            _server = replacement;
+            _codexExecutable = executable;
+            _codexWriteTime = writeTime;
+            _loadedThreads.Clear();
+            if (previous != null) await previous.DisposeAsync();
+            _log.LogInformation("Codex App Server updated without restarting Telegram Relay");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            if (replacement != null && !ReferenceEquals(_server, replacement))
+                await replacement.DisposeAsync();
+            _log.LogWarning(ex, "Could not start updated Codex App Server; will retry");
+        }
+    }
     private void PublishHealth(string state)
     {
         try
