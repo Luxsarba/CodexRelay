@@ -1058,29 +1058,72 @@ public sealed class Worker : BackgroundService
         return $"Topic закреплён за проектом {project}\nThread: {threadId}\nПоследний ответ:\n{Clip(await LastAnswer(threadId, ct), 3000)}";
     }
 
-    private async Task<string> LinkThreadTopic(long chatId, string project, ThreadChoice choice, CancellationToken ct)
+    private async Task<(string Summary, bool Busy)> LinkThreadTopic(long chatId, string project, ThreadChoice choice, CancellationToken ct)
     {
-        if (IsBound(choice.Id)) return "Этот thread уже привязан к другому topic.";
+        if (IsBound(choice.Id)) return ("Этот thread уже привязан к другому topic.", false);
         await EnsureCanManageTopics(chatId, ct);
         var result = await _server!.CallAsync("thread/read", new { threadId = choice.Id, includeTurns = false }, ct);
         var thread = result.GetProperty("thread");
         var path = GetString(thread, "cwd");
         if (!Path.IsPathFullyQualified(path) || !IsWithinProject(path, ProjectRoot(project)) ||
             (project.Length == 0 && _options.Projects.Values.Any(root => IsWithinProject(path, root))))
-            return "Thread больше не относится к выбранному проекту.";
+            return ("Thread больше не относится к выбранному проекту.", false);
         var load = await LoadThread(path, choice.Id, ct);
+        if (load.Busy) return ("Чат занят Codex Desktop. Можно создать ветку от последнего завершённого ответа, сохранив исходный чат в Desktop.", true);
         if (load.Error is { } loadError)
-            return loadError + "\nПоследний ответ:\n" +
-                Clip(await LastAnswer(choice.Id, ct), 3000);
+            return (loadError + "\nПоследний ответ:\n" +
+                Clip(await LastAnswer(choice.Id, ct), 3000), false);
         var title = GetString(thread, "name");
         if (title.Length == 0) title = GetString(thread, "preview");
         if (title.Length == 0) title = choice.Title;
         var lastAnswer = await LastAnswer(choice.Id, ct);
         var created = await CreateTopicAndBind(chatId, project, choice.Id, title, path, ct,
             $"Последний ответ:\n{Clip(lastAnswer, 3000)}");
-        return created.Summary;
+        return (created.Summary, false);
     }
 
+    private async Task<string> ForkUnboundThreadTopic(long chatId, string project,
+        ThreadChoice choice, CancellationToken ct)
+    {
+        if (IsBound(choice.Id)) return "Исходный thread уже привязан к topic.";
+        await EnsureCanManageTopics(chatId, ct);
+        var read = await _server!.CallAsync("thread/read",
+            new { threadId = choice.Id, includeTurns = false }, ct);
+        var source = read.GetProperty("thread");
+        var path = GetString(source, "cwd");
+        if (!Path.IsPathFullyQualified(path) || !IsWithinProject(path, ProjectRoot(project)) ||
+            (project.Length == 0 && _options.Projects.Values.Any(root => IsWithinProject(path, root))))
+            return "Thread больше не относится к выбранному проекту.";
+        var turns = await RecentTurns(choice.Id, ct);
+        var lastTurnId = turns.Reverse()
+            .Where(t => GetString(t, "status") is "completed" or "failed" or "interrupted")
+            .Select(t => GetString(t, "id"))
+            .FirstOrDefault(id => id.Length > 0);
+        if (turns.Length > 0 && lastTurnId == null)
+            return "В thread пока нет завершённого turn для ветвления.";
+        object forkParams = lastTurnId == null
+            ? new { threadId = choice.Id, cwd = path,
+                approvalPolicy = "on-request", sandbox = "workspace-write" }
+            : new { threadId = choice.Id, lastTurnId, cwd = path,
+                approvalPolicy = "on-request", sandbox = "workspace-write" };
+        var forked = await _server.CallAsync("thread/fork", forkParams, ct);
+        var id = forked.GetProperty("thread").GetProperty("id").GetString()!;
+        _loadedThreads.Add(id);
+        var title = GetString(source, "name");
+        if (title.Length == 0) title = GetString(source, "preview");
+        if (title.Length == 0) title = choice.Title;
+        try
+        {
+            var created = await CreateTopicAndBind(chatId, project, id, title + " · ветка", path, ct,
+                $"Ветка от thread: {choice.Id}\nПоследний ответ до ветвления:\n{Clip(DescribeLastAnswer(turns), 2800)}");
+            return created.Summary;
+        }
+        catch (Exception ex)
+        {
+            return $"Создан Codex thread: {id}\nTopic создать не удалось: {ex.Message}\n" +
+                $"Привязка не сохранена. Повторите /link{(project.Length == 0 ? "" : " " + project)} в General.";
+        }
+    }
     private async Task ForkThreadTopic(TopicAddress sourceAddress, TopicBinding binding, CancellationToken ct)
     {
         if (!TryProjectRoot(binding.Project, out var projectPath))
@@ -1370,17 +1413,41 @@ public sealed class Worker : BackgroundService
             if (parts[0] == "b" && parts.Length == 3 && int.TryParse(parts[2], out var index) &&
                 index >= 0 && index < menu.Threads.Count)
             {
+                await _bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
                 var result = menu.CreateTopic
                     ? await LinkThreadTopic(address.ChatId, menu.Project, menu.Threads[index], ct)
-                    : await Bind(address, menu.Project, menu.Threads[index].Id, ct);
-                await _bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
+                    : (await Bind(address, menu.Project, menu.Threads[index].Id, ct), false);
+                var reply = result.Item2
+                    ? new InlineKeyboardMarkup(new[]
+                    {
+                        new[] { InlineKeyboardButton.WithCallbackData("Создать ветку", $"f:{parts[1]}:{index}") },
+                        new[] { InlineKeyboardButton.WithCallbackData("Назад к чатам", $"r:{parts[1]}") }
+                    })
+                    : address.IsGeneral ? GeneralBackButton() : null;
                 await _bot.EditMessageText(address.ChatId, callback.Message!.MessageId,
-                    "<b>Привязка</b>\n" + H(result), parseMode: ParseMode.Html,
-                    replyMarkup: address.IsGeneral ? GeneralBackButton() : null, cancellationToken: ct);
+                    "<b>Привязка</b>\n" + H(result.Item1), parseMode: ParseMode.Html,
+                    replyMarkup: reply, cancellationToken: ct);
+                if (!result.Item2) _menus.Remove(parts[1]);
+                return;
+            }
+            if (parts[0] == "f" && parts.Length == 3 && menu.CreateTopic &&
+                int.TryParse(parts[2], out var forkIndex) && forkIndex >= 0 && forkIndex < menu.Threads.Count)
+            {
+                await _bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
+                var result = await ForkUnboundThreadTopic(address.ChatId, menu.Project, menu.Threads[forkIndex], ct);
+                await _bot.EditMessageText(address.ChatId, callback.Message!.MessageId,
+                    "<b>Ветка чата</b>\n" + H(result), parseMode: ParseMode.Html,
+                    replyMarkup: GeneralBackButton(), cancellationToken: ct);
                 _menus.Remove(parts[1]);
                 return;
             }
-            if (parts[0] == "p" && menu.NextCursor.Length > 0)
+            if (parts[0] == "r" && parts.Length == 2 && menu.CreateTopic)
+            {
+                await _bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
+                await ShowThreads(address, menu.Project, "", callback.Message!.MessageId, true, ct);
+                _menus.Remove(parts[1]);
+                return;
+            }            if (parts[0] == "p" && menu.NextCursor.Length > 0)
             {
                 await _bot.AnswerCallbackQuery(callback.Id, cancellationToken: ct);
                 await ShowThreads(address, menu.Project, menu.NextCursor, callback.Message!.MessageId,
