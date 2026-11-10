@@ -193,6 +193,17 @@ public sealed class Worker : BackgroundService
         }
         var message = update.Message;
         if (message?.From?.Id != _options.OwnerUserId || !TryAddress(message, out var address)) return;
+        if (message.Document is { } document)
+        {
+            if (address.IsGeneral || !_store.State.Topics.TryGetValue(address.Key, out var binding))
+            {
+                await Send(address, "Прикрепите документ в привязанной рабочей теме.", ct);
+                return;
+            }
+            var statusId = await TaskStatus(address, 0, "Получаю документ", ct);
+            _ = ReceiveDocument(address, binding, document, message.Caption?.Trim(), statusId, ct);
+            return;
+        }
         var input = message.Text?.Trim();
         if (string.IsNullOrWhiteSpace(input)) return;
         if (input.StartsWith('/')) await Command(address, input, ct);
@@ -204,6 +215,52 @@ public sealed class Worker : BackgroundService
         else await StartTask(address, input, ct);
     }
 
+    private async Task ReceiveDocument(TopicAddress address, TopicBinding binding, Document document,
+        string? caption, int statusId, CancellationToken ct)
+    {
+        string? target = null;
+        var downloaded = false;
+        try
+        {
+            var safeName = Path.GetFileName((document.FileName ?? "document").Replace('/', Path.DirectorySeparatorChar));
+            safeName = string.Concat(safeName.Where(ch => !Path.GetInvalidFileNameChars().Contains(ch)));
+            if (string.IsNullOrWhiteSpace(safeName)) safeName = "document";
+            if (safeName.Length > 120) safeName = safeName[^120..];
+            var root = Path.GetDirectoryName(Path.GetFullPath(_options.StateFile))!;
+            var directory = Path.Combine(root, "artifacts", "uploads", binding.ThreadId);
+            Directory.CreateDirectory(directory);
+            target = Path.Combine(directory, Guid.NewGuid().ToString("N")[..10] + "-" + safeName);
+            var remote = await _bot.GetFile(document.FileId, cancellationToken: ct);
+            await using (var stream = new FileStream(target, FileMode.CreateNew, FileAccess.Write,
+                FileShare.None, 81920, FileOptions.Asynchronous))
+                await _bot.DownloadFile(remote, stream, ct);
+            downloaded = true;
+            var prompt = (string.IsNullOrWhiteSpace(caption)
+                ? "Прочитай приложенный документ и дождись моего следующего сообщения."
+                : caption) + "\n\nПриложенный документ: " + target;
+            await _gate.WaitAsync(ct);
+            try
+            {
+                await StartTask(address, prompt, ct, statusId);
+                await _store.SaveAsync();
+            }
+            finally { _gate.Release(); }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            if (!downloaded && target != null) { try { File.Delete(target); } catch (IOException) { } }
+        }
+        catch (Exception ex)
+        {
+            if (!downloaded && target != null)
+            {
+                try { File.Delete(target); } catch (IOException) { }
+            }
+            _log.LogError(ex, "Could not receive Telegram document {FileId}", document.FileId);
+            try { await TaskStatus(address, statusId, "Не удалось получить документ: " + ex.Message, CancellationToken.None); }
+            catch (Exception sendError) { _log.LogWarning(sendError, "Could not report document error"); }
+        }
+    }
     private async Task Command(TopicAddress address, string input, CancellationToken ct)
     {
         var words = input.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
@@ -224,6 +281,7 @@ public sealed class Worker : BackgroundService
                     "<code>/log</code>  Журнал задачи\n" +
                     "<code>/files</code>  Файлы последней задачи\n" +
                     "<code>/file</code>  Получить файл по пути\n" +
+                    "Документ — приложить к задаче; подпись = инструкция\n" +
                     "<code>/model</code>  Выбор модели\n" +
                     "<code>/fork</code>  Ветка чата\n" +
                     "<code>/usage</code>  Лимиты\n" +
@@ -1516,7 +1574,14 @@ public sealed class Worker : BackgroundService
         }
         if (ActiveRun(address) is { } currentRun)
         {
-            if (queued == null) await SteerTask(currentRun, text, ct);
+            if (queued == null)
+            {
+                var steerCount = currentRun.SteerCount;
+                await SteerTask(currentRun, text, ct);
+                if (statusMessageId != 0)
+                    await TaskStatus(address, statusMessageId,
+                        currentRun.SteerCount > steerCount ? "Документ передан в текущую задачу" : "Документ сохранён для следующей задачи", ct);
+            }
             return false;
         }
         if (queued == null && _store.State.PendingTasks.Any(task =>
